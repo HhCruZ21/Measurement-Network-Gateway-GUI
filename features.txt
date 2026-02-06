@@ -1,0 +1,35 @@
+i want to build a GUI using gtk 3 library
+
+if the total height of the window is 100 %, I want an overall padding of 2% on all sides
+
+i want a top section which is about 10% this is section A, next section is B and it is 55 % for a graph, section C 18%, last section D of 13%
+
+in section A, after padding i have 96% left, I want a text box, 2 buttons, 5 checkboxes horizontally. you can decide the space each have between them but make it good. 1st button is connect button, 2nd is disconnect button, checkbox 1 is "Temp", checkbox 2 is ADC0, checkbox 3 is ADC1, checkbox 4 is switches, checkbox 5 is push buttons
+
+section B is graph
+
+section C has 2 buttons, dropdown of texts, textbox with Hz as a text on its side showing what you put into the text box is Hz value and a button for submitting this value. 1st button is start button, 2nd button is stop button, dropdown of texts fill with 3 random values i will configure it later, submit button with configure text.
+
+section D is command line like text box which works on pressing enter
+
+Following constraints
+
+Before connect successful, only connect button and the text box in section A is enabled, every other button, checkbox, dropdown, command line is disabled
+
+After connect successful, disable connect and enable start button, disconnect button. keep others still disabled.
+
+Once start is pressed, disable start, disabled disconnect, disable the textbox for client and disconnect with the set value visible. enable the checkboxes, stop button, dropdown, textbox for Hz, configure button and command line
+
+Once stop is pressed, enable start and disconnect button, disable stop, disable the checkboxes, stop button, dropdown, textbox for Hz, configure button and command line, keep the connect textbox also disabled
+
+
+
+i want a little space between section C and section D, currently they seem attached
+
+on the checkboxes a minimum of 2 must be selected when enabled maximum of all can be selected, when disabled all are unselected in UI, give updated complete code
+
+checkbox and dropdown have same entries, Temp, ADC0, ADC1, Switches, Push Btns. only checked push buttons must be visible in dropdown as options. give updated complete code, and connect button initially will be disabled unless there is something entered into connect textbox
+
+configure button must be disabled till a valid entry is put into Hz text box, give updated complete UI code
+
+for each sensor configure value, if it was set before that value should be retained in the textbox when changing between sensors, and in command line if command is valid have a green border for like 2 seconds and if its invalid command a red border for 2 seconds and a text showing below command line on success "command executed" and on failure "command execution failed". in the command line have a placeholder "SET CHOOSE_SENSOR_ID FREQ_IN_HZ". give updated UI code
