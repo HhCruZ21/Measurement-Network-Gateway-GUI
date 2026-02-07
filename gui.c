@@ -2,12 +2,30 @@
 #include <string.h>
 #include <ctype.h>
 
+/* ---------- Connect with backend ---------- */
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdint.h>
+
 /* ---------- Sensor Model ---------- */
 
+typedef struct
+{
+    uint32_t sensor_id;
+    uint32_t value;
+    uint64_t timestamp;
+} sensor_sample_t;
+
+#define PORT 50012
 #define SENSOR_COUNT 5
 
+static int sock_fd = -1;
+
 const char *sensor_ids[SENSOR_COUNT] = {
-    "TEMP", "ADC0", "ADC1", "SWITCHES", "PUSH"};
+    "TEMP", "ADC0", "ADC1", "SW", "PB"};
 
 const char *sensor_labels[SENSOR_COUNT] = {
     "Temp", "ADC 0", "ADC 1", "Switches", "Push Buttons"};
@@ -205,23 +223,41 @@ static void cmd_enter(GtkEntry *e, gpointer d)
     const char *id = NULL;
 
     if (tok1 && tok2 && tok3 && !extra &&
-        g_ascii_strcasecmp(tok1, "SET") == 0 &&
+        g_ascii_strcasecmp(tok1, "CONFIGURE") == 0 &&
         (id = canonical_sensor(tok2)))
     {
-
+        /* validate numeric rate */
         for (int i = 0; tok3[i]; i++)
-            if (!isdigit(tok3[i]))
+        {
+            if (!isdigit((unsigned char)tok3[i]))
                 goto done;
+        }
 
-        if (atoi(tok3) > 0)
+        int rate = atoi(tok3);
+        if (rate > 0)
         {
             valid = TRUE;
-            g_hash_table_replace(sensor_freq, g_strdup(id), g_strdup(tok3));
 
+            /* update local model */
+            g_hash_table_replace(sensor_freq,
+                                 g_strdup(id),
+                                 g_strdup(tok3));
+
+            /* update Hz entry if same sensor selected */
             const char *active =
                 gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
             if (active && strcmp(active, id) == 0)
                 gtk_entry_set_text(GTK_ENTRY(hz_entry), tok3);
+
+            /* send to server */
+            if (sock_fd >= 0)
+            {
+                char net_cmd[64];
+                snprintf(net_cmd, sizeof(net_cmd),
+                         "CONFIGURE %s %d\n", id, rate);
+                send(sock_fd, net_cmd, strlen(net_cmd), 0);
+                printf("Sent: %s", net_cmd);
+            }
         }
     }
 
@@ -299,18 +335,65 @@ static void apply_state()
 
 static void connect_clicked(GtkButton *b, gpointer d)
 {
+    const char *ip = gtk_entry_get_text(GTK_ENTRY(connect_entry));
+    if (!ip || !*ip)
+        return;
+
+    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock_fd < 0)
+    {
+        perror("socket");
+        return;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1)
+    {
+        perror("inet_pton");
+        close(sock_fd);
+        sock_fd = -1;
+        return;
+    }
+
+    if (connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        perror("connect");
+        close(sock_fd);
+        sock_fd = -1;
+        return;
+    }
+
+    printf("Connected to server %s\n", ip);
+
     state = STATE_CONNECTED;
     apply_state();
 }
 
 static void disconnect_clicked(GtkButton *b, gpointer d)
 {
+    if (sock_fd >= 0)
+    {
+        close(sock_fd);
+        sock_fd = -1;
+        printf("Disconnected from server\n");
+    }
+
     state = STATE_DISCONNECTED;
     apply_state();
 }
 
 static void start_clicked(GtkButton *b, gpointer d)
 {
+    if (sock_fd < 0)
+        return;
+
+    send(sock_fd, "START\n", 6, 0);
+    printf("Sent START\n");
+
     state = STATE_RUNNING;
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(checkboxes[0]), TRUE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(checkboxes[2]), TRUE);
@@ -320,6 +403,12 @@ static void start_clicked(GtkButton *b, gpointer d)
 
 static void stop_clicked(GtkButton *b, gpointer d)
 {
+    if (sock_fd < 0)
+        return;
+
+    send(sock_fd, "STOP\n", 5, 0);
+    printf("Sent STOP\n");
+
     state = STATE_CONNECTED;
     apply_state();
 }
@@ -596,7 +685,7 @@ int main(int argc, char **argv)
     /* Section D */
     cmd_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(cmd_entry),
-                                   "SET SENSOR_ID FREQ_IN_HZ");
+                                   "CONFIGURE SENSOR_ID FREQ_IN_HZ");
     gtk_box_pack_start(GTK_BOX(main_v), cmd_entry, FALSE, FALSE, 0);
     /* Command line default icon (idle state) */
     gtk_entry_set_icon_from_icon_name(
