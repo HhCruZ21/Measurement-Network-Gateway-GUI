@@ -6,9 +6,12 @@
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include <errno.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <inttypes.h>
 
 /* ---------- Sensor Model ---------- */
 
@@ -16,6 +19,39 @@
 #define SENSOR_COUNT 5
 #define CMD_HISTORY_SIZE 5
 #define MAX_SAMPLES 1024
+
+#define TIME_WINDOW_US 5e6 // 5 seconds visible
+
+typedef enum
+{
+    temp_sid = 0,
+    adc_zero_sid,
+    adc_one_sid,
+    sw_sid,
+    pb_sid,
+    snsr_cnt
+} sensor_id_t;
+
+typedef struct
+{
+    sensor_id_t sensor_id;
+    unsigned int sensor_value;
+    uint64_t timestamp;
+} sensor_data_t;
+
+static uint64_t sample_ts[SENSOR_COUNT][MAX_SAMPLES];
+static uint64_t first_ts = 0;
+
+static uint64_t global_t_min = 0;
+static uint64_t global_t_max = 0;
+
+static gboolean is_valid_ipv4(const char *ip);
+static void set_enabled(GtkWidget *w, gboolean e);
+void push_sample(int sid, double value);
+static void *net_rx_thread(void *arg);
+static int recv_all(int fd, void *buf, size_t len);
+
+static gboolean suppress_checkbox_cb = FALSE;
 
 static int sock_fd = -1;
 static pthread_t net_thread;
@@ -37,6 +73,7 @@ const char *sensor_labels[SENSOR_COUNT] = {
 
 static double sample_data[SENSOR_COUNT][MAX_SAMPLES];
 static int sample_count[SENSOR_COUNT] = {0};
+static int sample_head[SENSOR_COUNT] = {0};
 
 /* Plot colors (Matplotlib default palette) */
 static const double plot_colors[SENSOR_COUNT][3] = {
@@ -46,7 +83,6 @@ static const double plot_colors[SENSOR_COUNT][3] = {
     {0xD6 / 255.0, 0x27 / 255.0, 0x28 / 255.0}, // Red
     {0x94 / 255.0, 0x67 / 255.0, 0xBD / 255.0}  // Purple
 };
-
 
 static const char *canonical_sensor(const char *s)
 {
@@ -74,7 +110,7 @@ static AppState state = STATE_DISCONNECTED;
 
 /* ---------- Widgets ---------- */
 
-GtkWidget *connect_entry, *connect_btn, *disconnect_btn;
+GtkWidget *connect_entry, *connect_btn, *disconnect_btn, *shutdown_btn;
 GtkWidget *start_btn, *stop_btn;
 GtkWidget *checkboxes[SENSOR_COUNT];
 GtkWidget *combo;
@@ -119,6 +155,69 @@ static void load_css(void)
 
 /* ---------- Utilities ---------- */
 
+static void apply_state()
+{
+    gboolean connected = (state != STATE_DISCONNECTED);
+    gboolean running = (state == STATE_RUNNING);
+
+    const char *ip = gtk_entry_get_text(GTK_ENTRY(connect_entry));
+    gboolean ip_ok = is_valid_ipv4(ip);
+
+    GtkStyleContext *ctx =
+        gtk_widget_get_style_context(connect_entry);
+
+    gtk_style_context_remove_class(ctx, "cmd-error");
+
+    if (*ip && !ip_ok)
+        gtk_style_context_add_class(ctx, "cmd-error");
+
+    set_enabled(connect_btn, !connected && ip_ok);
+
+    set_enabled(connect_entry, !connected);
+
+    set_enabled(disconnect_btn, connected && !running);
+    set_enabled(shutdown_btn, connected && !running);
+    set_enabled(start_btn, connected && !running);
+    set_enabled(stop_btn, running);
+
+    suppress_checkbox_cb = TRUE;
+
+    for (int i = 0; i < SENSOR_COUNT; i++)
+        set_enabled(checkboxes[i], running);
+
+    suppress_checkbox_cb = FALSE;
+
+    set_enabled(combo, running);
+    set_enabled(hz_entry, running);
+    set_enabled(config_btn,
+                running && strlen(gtk_entry_get_text(GTK_ENTRY(hz_entry))) > 0);
+    set_enabled(cmd_entry, running);
+}
+
+static gboolean is_valid_ipv4(const char *ip)
+{
+    if (!ip || !*ip)
+        return FALSE;
+
+    int a, b, c, d;
+    char tail;
+
+    /* Strict format: a.b.c.d and nothing else */
+    if (sscanf(ip, "%d.%d.%d.%d%c", &a, &b, &c, &d, &tail) != 4)
+        return FALSE;
+
+    if (a < 0 || a > 255)
+        return FALSE;
+    if (b < 0 || b > 255)
+        return FALSE;
+    if (c < 0 || c > 255)
+        return FALSE;
+    if (d < 0 || d > 255)
+        return FALSE;
+
+    return TRUE;
+}
+
 static void set_enabled(GtkWidget *w, gboolean e)
 {
     gtk_widget_set_sensitive(w, e);
@@ -131,6 +230,96 @@ static int checked_count()
         if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(checkboxes[i])))
             c++;
     return c;
+}
+
+static void shutdown_clicked(GtkButton *b, gpointer d)
+{
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(b))),
+        GTK_DIALOG_MODAL,
+        GTK_MESSAGE_WARNING,
+        GTK_BUTTONS_YES_NO,
+        "Are you sure you want to shutdown the device /dev/meascdd?");
+
+    gtk_window_set_title(GTK_WINDOW(dialog), "Confirm Shutdown");
+
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    if (response != GTK_RESPONSE_YES)
+    {
+        /* User chose NO → do nothing */
+        return;
+    }
+
+    /* -------- User confirmed shutdown -------- */
+
+    /* Stop streaming if running */
+    if (state == STATE_RUNNING && sock_fd >= 0)
+    {
+        send(sock_fd, "STOP\n", 5, 0);
+        printf("Sent STOP (before shutdown)\n");
+    }
+
+    if (net_running)
+    {
+        net_running = 0;
+        shutdown(sock_fd, SHUT_RDWR);
+        pthread_join(net_thread, NULL);
+    }
+
+    if (sock_fd >= 0)
+    {
+        send(sock_fd, "SHUTDOWN\n", 9, 0);
+        printf("Sent SHUTDOWN\n");
+
+        close(sock_fd);
+        sock_fd = -1;
+    }
+
+    state = STATE_DISCONNECTED;
+    apply_state();
+    gtk_main_quit();
+}
+
+static gboolean redraw_graph(gpointer data)
+{
+    gtk_widget_queue_draw(graph_area);
+    return G_SOURCE_REMOVE;
+}
+
+static void *net_rx_thread(void *arg)
+{
+    sensor_data_t pkt;
+
+    while (net_running)
+    {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(sock_fd, &rfds);
+
+        struct timeval tv = {
+            .tv_sec = 0,
+            .tv_usec = 200000 // 200 ms
+        };
+
+        int ret = select(sock_fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret <= 0)
+            continue; // timeout or signal
+
+        ssize_t n = recv(sock_fd, &pkt, sizeof(pkt), 0);
+        if (n <= 0)
+            break; // server closed or error
+
+        if (pkt.sensor_id < SENSOR_COUNT)
+        {
+            push_sample(pkt.sensor_id, pkt.sensor_value);
+            g_idle_add(redraw_graph, NULL);
+        }
+    }
+
+    return NULL;
 }
 
 /* ---------- Focus handling ---------- */
@@ -154,6 +343,31 @@ static void update_dropdown()
                                       sensor_ids[i], sensor_labels[i]);
     }
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
+}
+
+void push_sample(int sid, double value)
+{
+    uint64_t ts = g_get_monotonic_time();
+
+    sample_data[sid][sample_head[sid]] = value;
+    sample_ts[sid][sample_head[sid]] = ts;
+
+    sample_head[sid] = (sample_head[sid] + 1) % MAX_SAMPLES;
+
+    if (sample_count[sid] < MAX_SAMPLES)
+        sample_count[sid]++;
+
+    /* ---------- Incremental time window tracking ---------- */
+
+    if (global_t_min == 0 || ts < global_t_min)
+        global_t_min = ts;
+
+    if (ts > global_t_max)
+        global_t_max = ts;
+
+    /* Enforce sliding window */
+    if (global_t_max - global_t_min > TIME_WINDOW_US)
+        global_t_min = global_t_max - TIME_WINDOW_US;
 }
 
 static void combo_changed(GtkComboBox *box, gpointer d)
@@ -208,11 +422,18 @@ static gboolean cmd_key_press(GtkWidget *w, GdkEventKey *e, gpointer d)
 
 static void checkbox_changed(GtkToggleButton *btn, gpointer d)
 {
-    if (checked_count() < 2)
-    {
-        gtk_toggle_button_set_active(btn, TRUE);
+    if (suppress_checkbox_cb)
         return;
+
+    if (state == STATE_RUNNING)
+    {
+        if (checked_count() < 2)
+        {
+            gtk_toggle_button_set_active(btn, TRUE);
+            return;
+        }
     }
+
     update_dropdown();
 
     if (graph_area)
@@ -413,68 +634,6 @@ done:;
 
 /* ---------- State Machine ---------- */
 
-static gboolean is_valid_ipv4(const char *ip)
-{
-    if (!ip || !*ip)
-        return FALSE;
-
-    int a, b, c, d;
-    char tail;
-
-    /* Strict format: a.b.c.d and nothing else */
-    if (sscanf(ip, "%d.%d.%d.%d%c", &a, &b, &c, &d, &tail) != 4)
-        return FALSE;
-
-    if (a < 0 || a > 255)
-        return FALSE;
-    if (b < 0 || b > 255)
-        return FALSE;
-    if (c < 0 || c > 255)
-        return FALSE;
-    if (d < 0 || d > 255)
-        return FALSE;
-
-    return TRUE;
-}
-
-static void apply_state()
-{
-    gboolean connected = (state != STATE_DISCONNECTED);
-    gboolean running = (state == STATE_RUNNING);
-
-    const char *ip = gtk_entry_get_text(GTK_ENTRY(connect_entry));
-    gboolean ip_ok = is_valid_ipv4(ip);
-
-    GtkStyleContext *ctx =
-        gtk_widget_get_style_context(connect_entry);
-
-    gtk_style_context_remove_class(ctx, "cmd-error");
-
-    if (*ip && !ip_ok)
-        gtk_style_context_add_class(ctx, "cmd-error");
-
-    set_enabled(connect_btn, !connected && ip_ok);
-
-    set_enabled(connect_entry, !connected);
-
-    set_enabled(disconnect_btn, connected && !running);
-    set_enabled(start_btn, connected && !running);
-    set_enabled(stop_btn, running);
-
-    for (int i = 0; i < SENSOR_COUNT; i++)
-    {
-        set_enabled(checkboxes[i], running);
-        if (!running)
-            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(checkboxes[i]), FALSE);
-    }
-
-    set_enabled(combo, running);
-    set_enabled(hz_entry, running);
-    set_enabled(config_btn,
-                running && strlen(gtk_entry_get_text(GTK_ENTRY(hz_entry))) > 0);
-    set_enabled(cmd_entry, running);
-}
-
 /* ---------- Buttons ---------- */
 
 static void connect_clicked(GtkButton *b, gpointer d)
@@ -517,6 +676,8 @@ static void connect_clicked(GtkButton *b, gpointer d)
     connected_ip[sizeof(connected_ip) - 1] = '\0';
 
     state = STATE_CONNECTED;
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(checkboxes[0]), TRUE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(checkboxes[2]), TRUE);
     apply_state();
 }
 
@@ -565,6 +726,13 @@ static gboolean on_window_delete(GtkWidget *widget,
         printf("Sent STOP (on exit)\n");
     }
 
+    if (net_running)
+    {
+        net_running = 0;
+        shutdown(sock_fd, SHUT_RDWR);   // unblock recv
+        pthread_join(net_thread, NULL); // wait for thread to exit
+    }
+
     if (sock_fd >= 0)
     {
         close(sock_fd);
@@ -580,6 +748,13 @@ static gboolean on_window_delete(GtkWidget *widget,
 
 static void disconnect_clicked(GtkButton *b, gpointer d)
 {
+    if (net_running)
+    {
+        net_running = 0;
+        shutdown(sock_fd, SHUT_RDWR);
+        pthread_join(net_thread, NULL);
+    }
+
     if (sock_fd >= 0)
     {
         close(sock_fd);
@@ -599,11 +774,27 @@ static void start_clicked(GtkButton *b, gpointer d)
     send(sock_fd, "START\n", 6, 0);
     printf("Sent START\n");
 
+    net_running = 1;
+    pthread_create(&net_thread, NULL, net_rx_thread, NULL);
+
     state = STATE_RUNNING;
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(checkboxes[0]), TRUE);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(checkboxes[2]), TRUE);
     update_dropdown();
     apply_state();
+}
+
+static int recv_all(int fd, void *buf, size_t len)
+{
+    size_t off = 0;
+    char *p = buf;
+
+    while (off < len)
+    {
+        ssize_t n = recv(fd, p + off, len - off, 0);
+        if (n <= 0)
+            return -1;
+        off += n;
+    }
+    return 0;
 }
 
 static void stop_clicked(GtkButton *b, gpointer d)
@@ -614,52 +805,159 @@ static void stop_clicked(GtkButton *b, gpointer d)
     send(sock_fd, "STOP\n", 5, 0);
     printf("Sent STOP\n");
 
+    net_running = 0;
+    pthread_join(net_thread, NULL);
+
     state = STATE_CONNECTED;
     apply_state();
+}
+
+static GdkRGBA
+adjust_bg_for_legend(GdkRGBA bg)
+{
+    GdkRGBA out = bg;
+
+    /* Perceived luminance (sRGB) */
+    double lum = 0.2126 * bg.red +
+                 0.7152 * bg.green +
+                 0.0722 * bg.blue;
+
+    if (lum < 0.5)
+    {
+        /* Dark theme → lighten */
+        out.red = bg.red + (1.0 - bg.red) * 0.15;
+        out.green = bg.green + (1.0 - bg.green) * 0.15;
+        out.blue = bg.blue + (1.0 - bg.blue) * 0.15;
+    }
+    else
+    {
+        /* Light theme → darken */
+        out.red = bg.red * 0.92;
+        out.green = bg.green * 0.92;
+        out.blue = bg.blue * 0.92;
+    }
+
+    out.alpha = 1.0;
+    return out;
 }
 
 static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
     GtkAllocation alloc;
     gtk_widget_get_allocation(widget, &alloc);
+    int plot_w, plot_h;
+    const int legend_margin = 120;
 
     int width = alloc.width;
     int height = alloc.height;
 
-    const int grid_spacing = 70;  // bigger grid
-    const int bottom_margin = 35; // space for x-axis label
-    const int left_margin = 45;   // space for y-axis
-    const int arrow_size = 10;    // axis arrow size
+    const int grid_spacing = 70;        // bigger grid
+    const int bottom_margin = 60;       // ticks ↔ x-axis label
+    const int left_margin = 60;         // ticks ↔ y-axis line
+    const int outer_bottom_margin = 12; // space below x-axis label
+    const int outer_left_margin = 15;   // space left of y-axis label
+    const int arrow_size = 10;          // axis arrow size
+
+    plot_w = width - left_margin - 10;
+    plot_h = height - bottom_margin - 10;
+
+    /* ================== Time Window (global, incremental) ================== */
+    if (global_t_max <= global_t_min)
+        return FALSE;
+
+    uint64_t t_min = global_t_min;
+    uint64_t t_max = global_t_max;
+
+    /* ================== Y-axis Auto Scaling ================== */
+    double y_max = 1.0; // avoid divide-by-zero
+
+    for (int s = 0; s < SENSOR_COUNT; s++)
+    {
+        if (!is_sensor_selected(s))
+            continue;
+
+        int count = sample_count[s];
+        int head = sample_head[s];
+
+        for (int i = 0; i < count; i++)
+        {
+            int idx = (head + i) % MAX_SAMPLES;
+            double v = sample_data[s][idx];
+
+            if (v > y_max)
+                y_max = v;
+        }
+    }
+
+    /* Round y_max up to a nice grid value */
+    double grid_step = 1.0;
+    while (grid_step * 10.0 < y_max)
+        grid_step *= 10.0;
+
+    y_max = ceil(y_max / grid_step) * grid_step;
 
     /* ================== Faint Grid ================== */
     cairo_set_source_rgba(cr, 0.7, 0.7, 0.7, 0.1);
     cairo_set_line_width(cr, 1.0);
 
     /* Vertical grid lines */
-    for (int x = left_margin; x <= width; x += grid_spacing)
+    for (int x = left_margin; x <= left_margin + plot_w; x += grid_spacing)
     {
         cairo_move_to(cr, x + 0.5, 0);
         cairo_line_to(cr, x + 0.5, height - bottom_margin);
     }
 
     /* Horizontal grid lines */
-    for (int y = 0; y <= height - bottom_margin; y += grid_spacing)
+    /* Horizontal grid lines + Y labels */
+    int grid_count = (height - bottom_margin) / grid_spacing;
+
+    for (int i = 0; i <= grid_count; i++)
     {
+        double y = i * grid_spacing;
+
         cairo_move_to(cr, left_margin, y + 0.5);
-        cairo_line_to(cr, width, y + 0.5);
+        cairo_line_to(cr, left_margin + plot_w, y + 0.5);
+    }
+    cairo_stroke(cr);
+
+    /* ================== Theme-aware axis color ================== */
+    GtkWidget *toplevel = gtk_widget_get_toplevel(widget);
+    GtkStyleContext *context =
+        gtk_widget_get_style_context(toplevel);
+
+    GtkStateFlags state = gtk_style_context_get_state(context);
+
+    GdkRGBA fg;
+    GdkRGBA bg;
+
+    gtk_style_context_get_color(context, state, &fg);
+    gtk_style_context_get_background_color(context, state, &bg);
+
+    cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, fg.alpha);
+
+    /* Y-axis labels */
+    cairo_set_font_size(cr, 11);
+
+    for (int i = 0; i <= grid_count; i++)
+    {
+        double y = i * grid_spacing;
+        double val = y_max * (1.0 - (double)i / grid_count);
+
+        char label[32];
+        snprintf(label, sizeof(label), "%.0f", val);
+
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, label, &ext);
+
+        cairo_move_to(cr,
+                      left_margin - ext.width - 6,
+                      y + ext.height / 2);
+        cairo_show_text(cr, label);
     }
 
     cairo_stroke(cr);
 
-    /* ================== Theme-aware axis color ================== */
-    GtkStyleContext *context =
-        gtk_widget_get_style_context(widget);
-
-    GdkRGBA fg;
-    gtk_style_context_get_color(
-        context,
-        gtk_style_context_get_state(context),
-        &fg);
+    GdkRGBA legend_bg = adjust_bg_for_legend(bg);
 
     cairo_set_source_rgba(cr,
                           fg.red,
@@ -670,21 +968,111 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     /* ================== Axes ================== */
 
     /* ================== Legend Placeholder ================== */
+
+    /* ================== Signal Plot ================== */
+
+    for (int s = 0; s < SENSOR_COUNT; s++)
+    {
+        if (!is_sensor_selected(s))
+            continue;
+
+        if (sample_count[s] < 2)
+            continue;
+
+        cairo_set_source_rgb(cr,
+                             plot_colors[s][0],
+                             plot_colors[s][1],
+                             plot_colors[s][2]);
+
+        cairo_set_line_width(cr, 2.0);
+
+        int head = sample_head[s];
+        int count = sample_count[s];
+
+        for (int i = 0; i < count; i++)
+        {
+            int idx = (head + i) % MAX_SAMPLES;
+            double v = sample_data[s][idx];
+
+            uint64_t ts = sample_ts[s][idx];
+
+            if (ts < t_min)
+                continue; // outside window
+
+            double span = (double)(t_max - t_min);
+            if (span <= 0)
+                continue;
+
+            double x = left_margin +
+                       plot_w * (double)(ts - t_min) / span;
+
+            /* ADC-style scaling (0–4095) */
+            double y = plot_h * (1.0 - v / y_max);
+
+            if (i == 0)
+                cairo_move_to(cr, x, y);
+            else
+                cairo_line_to(cr, x, y);
+        }
+
+        cairo_stroke(cr);
+    }
+
     /* ================== Dynamic Legend ================== */
 
-    const int legend_x = width - 200;
+    /* Count active legend items */
+    int legend_items = 0;
+    for (int i = 0; i < SENSOR_COUNT; i++)
+    {
+        if (is_sensor_selected(i))
+            legend_items++;
+    }
+
+    const int legend_x = left_margin + plot_w - 190;
+
     int legend_y = 24;
     const int box_size = 12;
     const int row_spacing = 20;
 
+    const int legend_padding = 10;
+
+    /* Legend height = padding + title + rows */
+    int legend_height =
+        legend_padding * 2 +
+        row_spacing * (1 + legend_items); // 1 = "Legend:" title
+
     cairo_set_font_size(cr, 12);
 
     /* Legend title */
+    /* Clip legend to plot area */
+    cairo_save(cr);
+    cairo_rectangle(cr,
+                    left_margin,
+                    0,
+                    plot_w,
+                    plot_h);
+    cairo_clip(cr);
+
+    /* Legend background box (auto-sized) */
+    /* Legend background (theme-aware) */
+    cairo_set_source_rgba(cr,
+                          legend_bg.red,
+                          legend_bg.green,
+                          legend_bg.blue,
+                          1.0);
+
+    cairo_rectangle(cr,
+                    legend_x - legend_padding,
+                    legend_y - row_spacing + 4,
+                    130,
+                    legend_height);
+    cairo_fill(cr);
+
     cairo_set_source_rgba(cr,
                           fg.red,
                           fg.green,
                           fg.blue,
-                          fg.alpha);
+                          1.0);
 
     cairo_move_to(cr, legend_x, legend_y);
     cairo_show_text(cr, "Legend:");
@@ -708,7 +1096,7 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
                         box_size);
         cairo_fill(cr);
 
-        /* --- Label text (theme color, NOT colored) --- */
+        /* Legend text (theme foreground color) */
         cairo_set_source_rgba(cr,
                               fg.red,
                               fg.green,
@@ -723,23 +1111,14 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
 
         legend_y += row_spacing;
     }
+    cairo_restore(cr);
 
-    /* ================== Signal Plot Skeleton ================== */
-    for (int i = 0; i < SENSOR_COUNT; i++)
-    {
-        if (!is_sensor_selected(i))
-            continue;
-
-        /*
-         * REAL DATA WILL BE DRAWN HERE LATER
-         *
-         * When backend arrives:
-         *   - use plot_colors[i]
-         *   - draw only for selected sensors
-         *
-         * This conditional is the important part.
-         */
-    }
+    /* Reset color for axes (theme foreground) */
+    cairo_set_source_rgba(cr,
+                          fg.red,
+                          fg.green,
+                          fg.blue,
+                          fg.alpha);
 
     cairo_set_line_width(cr, 2.5);
 
@@ -749,7 +1128,9 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
 
     /* X-axis */
     cairo_move_to(cr, left_margin, height - bottom_margin + 0.5);
-    cairo_line_to(cr, width - arrow_size, height - bottom_margin + 0.5);
+    cairo_line_to(cr,
+                  left_margin + plot_w,
+                  height - bottom_margin + 0.5);
 
     cairo_stroke(cr);
 
@@ -757,9 +1138,10 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     cairo_set_line_width(cr, 2.5);
 
     /* X-axis arrow (right) */
-    cairo_move_to(cr, width - arrow_size, height - bottom_margin);
-    cairo_line_to(cr, width, height - bottom_margin + 0.5);
-    cairo_line_to(cr, width - arrow_size, height - bottom_margin + arrow_size);
+    cairo_move_to(cr, left_margin + plot_w, height - bottom_margin);
+    cairo_line_to(cr, left_margin + plot_w + arrow_size, height - bottom_margin + 0.5);
+    cairo_line_to(cr, left_margin + plot_w, height - bottom_margin + arrow_size);
+
     cairo_stroke(cr);
 
     /* Y-axis arrow (up) */
@@ -768,8 +1150,47 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     cairo_line_to(cr, left_margin + arrow_size, arrow_size);
     cairo_stroke(cr);
 
+    /* ================== X-axis Ticks ================== */
+
+    cairo_set_font_size(cr, 11);
+
+    int tick_count = plot_w / grid_spacing;
+    if (tick_count < 1)
+        tick_count = 1;
+    uint64_t tick_step_us = (t_max - t_min) / tick_count;
+
+    for (int i = 0; i <= tick_count; i++)
+    {
+        double x = left_margin + i * grid_spacing;
+        uint64_t t = t_min + i * tick_step_us;
+
+        /* Tick mark */
+        cairo_move_to(cr, x + 0.5, height - bottom_margin);
+        cairo_line_to(cr, x + 0.5, height - bottom_margin + 6);
+        cairo_stroke(cr);
+
+        /* Label */
+        char label[32];
+
+        /* Absolute monotonic time in milliseconds (reduced magnitude) */
+        uint64_t abs_ms = t / 1000;
+
+        /* Drop high digits to avoid clutter (keep last 5 digits) */
+        abs_ms %= 100000;
+
+        snprintf(label, sizeof(label), "%" PRIu64, abs_ms);
+
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, label, &ext);
+
+        cairo_move_to(cr,
+                      x - ext.width / 2,
+                      height - bottom_margin + 20);
+        cairo_show_text(cr, label);
+    }
+
     /* ================== X-axis Label ================== */
-    const char *xlabel = "Time in microseconds (\xCE\xBCs)"; // µs
+    const char *xlabel = "Time (absolute monotonic, ms)";
 
     cairo_select_font_face(cr, "Sans",
                            CAIRO_FONT_SLANT_NORMAL,
@@ -785,10 +1206,33 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     cairo_text_extents(cr, xlabel, &ext);
 
     double x = (width - ext.width) / 2.0 - ext.x_bearing;
-    double y = height - 10;
+    double y = height - outer_bottom_margin;
 
     cairo_move_to(cr, x, y);
     cairo_show_text(cr, xlabel);
+
+    /* ================== Y-axis Label ================== */
+    const char *ylabel = "Value";
+
+    cairo_save(cr);
+    cairo_translate(cr, outer_left_margin + 2, height / 2);
+
+    cairo_rotate(cr, -G_PI / 2);
+
+    cairo_set_font_size(cr, 14);
+    cairo_set_source_rgba(cr,
+                          fg.red,
+                          fg.green,
+                          fg.blue,
+                          fg.alpha);
+
+    cairo_text_extents_t yext;
+    cairo_text_extents(cr, ylabel, &yext);
+
+    cairo_move_to(cr, -yext.width / 2, 0);
+    cairo_show_text(cr, ylabel);
+
+    cairo_restore(cr);
 
     return FALSE;
 }
@@ -836,6 +1280,7 @@ int main(int argc, char **argv)
     gtk_box_pack_start(GTK_BOX(left), space_conn, FALSE, FALSE, 0);
     connect_btn = gtk_button_new_with_label("Connect");
     disconnect_btn = gtk_button_new_with_label("Disconnect");
+    shutdown_btn = gtk_button_new_with_label("Shutdown");
     /* Visual hierarchy: Connect = primary, Disconnect = caution */
     gtk_style_context_add_class(
         gtk_widget_get_style_context(connect_btn),
@@ -844,8 +1289,14 @@ int main(int argc, char **argv)
     gtk_style_context_add_class(
         gtk_widget_get_style_context(disconnect_btn),
         "destructive-action");
+
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(shutdown_btn),
+        "destructive-action");
+
     gtk_box_pack_start(GTK_BOX(left), connect_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(left), disconnect_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(left), shutdown_btn, FALSE, FALSE, 0);
 
     GtkWidget *right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
 
@@ -883,6 +1334,11 @@ int main(int argc, char **argv)
 
     g_signal_connect(graph_area, "draw",
                      G_CALLBACK(draw_grid), NULL);
+
+    /* Redraw plot when GTK theme / style changes */
+    g_signal_connect(win, "style-updated",
+                     G_CALLBACK(gtk_widget_queue_draw),
+                     graph_area);
 
     /* Section C */
     GtkWidget *secC = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -961,6 +1417,7 @@ int main(int argc, char **argv)
 
     g_signal_connect(connect_btn, "clicked", G_CALLBACK(connect_clicked), NULL);
     g_signal_connect(disconnect_btn, "clicked", G_CALLBACK(disconnect_clicked), NULL);
+    g_signal_connect(shutdown_btn, "clicked", G_CALLBACK(shutdown_clicked), NULL);
     g_signal_connect(start_btn, "clicked", G_CALLBACK(start_clicked), NULL);
     g_signal_connect(stop_btn, "clicked", G_CALLBACK(stop_clicked), NULL);
     g_signal_connect(connect_entry, "changed", G_CALLBACK(apply_state), NULL);
