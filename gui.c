@@ -12,23 +12,41 @@
 
 /* ---------- Sensor Model ---------- */
 
-typedef struct
-{
-    uint32_t sensor_id;
-    uint32_t value;
-    uint64_t timestamp;
-} sensor_sample_t;
-
 #define PORT 50012
 #define SENSOR_COUNT 5
+#define CMD_HISTORY_SIZE 5
+#define MAX_SAMPLES 1024
 
 static int sock_fd = -1;
+static pthread_t net_thread;
+static volatile int net_running = 0;
+
+static char connected_ip[64] = {0};
+
+/* ---------- Store command history ---------- */
+
+static char *cmd_history[CMD_HISTORY_SIZE];
+static int cmd_hist_count = 0;
+static int cmd_hist_index = -1;
 
 const char *sensor_ids[SENSOR_COUNT] = {
     "TEMP", "ADC0", "ADC1", "SW", "PB"};
 
 const char *sensor_labels[SENSOR_COUNT] = {
     "Temp", "ADC 0", "ADC 1", "Switches", "Push Buttons"};
+
+static double sample_data[SENSOR_COUNT][MAX_SAMPLES];
+static int sample_count[SENSOR_COUNT] = {0};
+
+/* Plot colors (Matplotlib default palette) */
+static const double plot_colors[SENSOR_COUNT][3] = {
+    {0x1F / 255.0, 0x77 / 255.0, 0xB4 / 255.0}, // Blue
+    {0xFF / 255.0, 0x7F / 255.0, 0x0E / 255.0}, // Orange
+    {0x2C / 255.0, 0xA0 / 255.0, 0x2C / 255.0}, // Green
+    {0xD6 / 255.0, 0x27 / 255.0, 0x28 / 255.0}, // Red
+    {0x94 / 255.0, 0x67 / 255.0, 0xBD / 255.0}  // Purple
+};
+
 
 static const char *canonical_sensor(const char *s)
 {
@@ -42,6 +60,8 @@ static const char *canonical_sensor(const char *s)
 }
 
 /* ---------- State ---------- */
+
+GtkWidget *graph_area;
 
 typedef enum
 {
@@ -146,6 +166,44 @@ static void combo_changed(GtkComboBox *box, gpointer d)
     gtk_entry_set_text(GTK_ENTRY(hz_entry), val ? val : "");
 }
 
+static gboolean is_sensor_selected(int idx)
+{
+    return gtk_toggle_button_get_active(
+        GTK_TOGGLE_BUTTON(checkboxes[idx]));
+}
+
+static gboolean cmd_key_press(GtkWidget *w, GdkEventKey *e, gpointer d)
+{
+    if (cmd_hist_count == 0)
+        return FALSE;
+
+    if (e->keyval == GDK_KEY_Up)
+    {
+        if (cmd_hist_index > 0)
+            cmd_hist_index--;
+
+        gtk_entry_set_text(GTK_ENTRY(w),
+                           cmd_history[cmd_hist_index]);
+        return TRUE;
+    }
+    else if (e->keyval == GDK_KEY_Down)
+    {
+        if (cmd_hist_index < cmd_hist_count - 1)
+        {
+            cmd_hist_index++;
+            gtk_entry_set_text(GTK_ENTRY(w),
+                               cmd_history[cmd_hist_index]);
+        }
+        else
+        {
+            cmd_hist_index = cmd_hist_count;
+            gtk_entry_set_text(GTK_ENTRY(w), "");
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
 /* ---------- Checkbox logic ---------- */
 
 static void checkbox_changed(GtkToggleButton *btn, gpointer d)
@@ -156,6 +214,9 @@ static void checkbox_changed(GtkToggleButton *btn, gpointer d)
         return;
     }
     update_dropdown();
+
+    if (graph_area)
+        gtk_widget_queue_draw(graph_area);
 }
 
 /* ---------- Hz ---------- */
@@ -168,12 +229,40 @@ static void hz_changed(GtkEditable *e, gpointer d)
 
 static void configure_clicked(GtkButton *b, gpointer d)
 {
-    const char *id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
-    const char *freq = gtk_entry_get_text(GTK_ENTRY(hz_entry));
+    if (sock_fd < 0)
+        return;
+
+    const char *id =
+        gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
+    const char *freq =
+        gtk_entry_get_text(GTK_ENTRY(hz_entry));
+
     if (!id || !*freq)
         return;
 
-    g_hash_table_replace(sensor_freq, g_strdup(id), g_strdup(freq));
+    /* validate numeric rate */
+    for (int i = 0; freq[i]; i++)
+    {
+        if (!isdigit((unsigned char)freq[i]))
+            return;
+    }
+
+    int rate = atoi(freq);
+    if (rate <= 0)
+        return;
+
+    /* send to server */
+    char net_cmd[64];
+    snprintf(net_cmd, sizeof(net_cmd),
+             "CONFIGURE %s %d\n", id, rate);
+    send(sock_fd, net_cmd, strlen(net_cmd), 0);
+
+    printf("Sent: %s", net_cmd);
+
+    /* update local model */
+    g_hash_table_replace(sensor_freq,
+                         g_strdup(id),
+                         g_strdup(freq));
 }
 
 /* ---------- Command Line ---------- */
@@ -203,6 +292,9 @@ static gboolean clear_cmd_feedback(gpointer data)
         GTK_ENTRY(ctx->entry),
         GTK_ENTRY_ICON_PRIMARY,
         "utilities-terminal-symbolic");
+
+    gtk_entry_set_text(GTK_ENTRY(ctx->entry), "");
+    gtk_widget_set_sensitive(ctx->entry, TRUE);
 
     g_free(ctx);
     return FALSE;
@@ -281,6 +373,22 @@ done:;
             GTK_ENTRY(e),
             GTK_ENTRY_ICON_PRIMARY,
             "emblem-ok-symbolic");
+
+        gtk_widget_set_sensitive(GTK_WIDGET(e), FALSE);
+
+        if (cmd_hist_count < CMD_HISTORY_SIZE)
+        {
+            cmd_history[cmd_hist_count++] = g_strdup(gtk_entry_get_text(e));
+        }
+        else
+        {
+            g_free(cmd_history[0]);
+            memmove(&cmd_history[0], &cmd_history[1],
+                    (CMD_HISTORY_SIZE - 1) * sizeof(char *));
+            cmd_history[CMD_HISTORY_SIZE - 1] =
+                g_strdup(gtk_entry_get_text(e));
+        }
+        cmd_hist_index = cmd_hist_count;
     }
     else
     {
@@ -293,6 +401,7 @@ done:;
             GTK_ENTRY(e),
             GTK_ENTRY_ICON_PRIMARY,
             "dialog-error-symbolic");
+        gtk_widget_set_sensitive(GTK_WIDGET(e), FALSE);
     }
 
     CmdClearCtx *ctx = g_malloc(sizeof(CmdClearCtx));
@@ -304,13 +413,48 @@ done:;
 
 /* ---------- State Machine ---------- */
 
+static gboolean is_valid_ipv4(const char *ip)
+{
+    if (!ip || !*ip)
+        return FALSE;
+
+    int a, b, c, d;
+    char tail;
+
+    /* Strict format: a.b.c.d and nothing else */
+    if (sscanf(ip, "%d.%d.%d.%d%c", &a, &b, &c, &d, &tail) != 4)
+        return FALSE;
+
+    if (a < 0 || a > 255)
+        return FALSE;
+    if (b < 0 || b > 255)
+        return FALSE;
+    if (c < 0 || c > 255)
+        return FALSE;
+    if (d < 0 || d > 255)
+        return FALSE;
+
+    return TRUE;
+}
+
 static void apply_state()
 {
     gboolean connected = (state != STATE_DISCONNECTED);
     gboolean running = (state == STATE_RUNNING);
 
-    set_enabled(connect_btn,
-                !connected && strlen(gtk_entry_get_text(GTK_ENTRY(connect_entry))) > 0);
+    const char *ip = gtk_entry_get_text(GTK_ENTRY(connect_entry));
+    gboolean ip_ok = is_valid_ipv4(ip);
+
+    GtkStyleContext *ctx =
+        gtk_widget_get_style_context(connect_entry);
+
+    gtk_style_context_remove_class(ctx, "cmd-error");
+
+    if (*ip && !ip_ok)
+        gtk_style_context_add_class(ctx, "cmd-error");
+
+    set_enabled(connect_btn, !connected && ip_ok);
+
     set_enabled(connect_entry, !connected);
 
     set_enabled(disconnect_btn, connected && !running);
@@ -369,8 +513,69 @@ static void connect_clicked(GtkButton *b, gpointer d)
 
     printf("Connected to server %s\n", ip);
 
+    strncpy(connected_ip, ip, sizeof(connected_ip) - 1);
+    connected_ip[sizeof(connected_ip) - 1] = '\0';
+
     state = STATE_CONNECTED;
     apply_state();
+}
+
+static gboolean on_window_delete(GtkWidget *widget,
+                                 GdkEvent *event,
+                                 gpointer user_data)
+{
+    /* If not connected, allow close immediately */
+    if (state == STATE_DISCONNECTED)
+    {
+        gtk_main_quit();
+        return TRUE;
+    }
+
+    /* Build message */
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "Client connected to IP %s.\n\nAre you sure you want to close?",
+             connected_ip[0] ? connected_ip : "unknown");
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(widget),
+        GTK_DIALOG_MODAL,
+        GTK_MESSAGE_WARNING,
+        GTK_BUTTONS_YES_NO,
+        "%s",
+        msg);
+
+    gtk_window_set_title(GTK_WINDOW(dialog), "Confirm Exit");
+
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    if (response != GTK_RESPONSE_YES)
+    {
+        /* User cancelled close */
+        return TRUE;
+    }
+
+    /* User confirmed close */
+
+    if (state == STATE_RUNNING)
+    {
+        /* Stop streaming first */
+        send(sock_fd, "STOP\n", 5, 0);
+        printf("Sent STOP (on exit)\n");
+    }
+
+    if (sock_fd >= 0)
+    {
+        close(sock_fd);
+        sock_fd = -1;
+        printf("Client socket closed (on exit)\n");
+    }
+
+    gtk_main_quit();
+
+    /* Allow GTK to close window */
+    return TRUE;
 }
 
 static void disconnect_clicked(GtkButton *b, gpointer d)
@@ -465,27 +670,76 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     /* ================== Axes ================== */
 
     /* ================== Legend Placeholder ================== */
+    /* ================== Dynamic Legend ================== */
+
+    const int legend_x = width - 200;
+    int legend_y = 24;
+    const int box_size = 12;
+    const int row_spacing = 20;
+
     cairo_set_font_size(cr, 12);
+
+    /* Legend title */
     cairo_set_source_rgba(cr,
                           fg.red,
                           fg.green,
                           fg.blue,
-                          0.6);
+                          fg.alpha);
 
-    int lx = width - 180;
-    int ly = 24;
-
-    cairo_move_to(cr, lx, ly);
+    cairo_move_to(cr, legend_x, legend_y);
     cairo_show_text(cr, "Legend:");
+    legend_y += row_spacing;
 
-    cairo_move_to(cr, lx, ly + 18);
-    cairo_show_text(cr, "• Temp");
+    for (int i = 0; i < SENSOR_COUNT; i++)
+    {
+        if (!is_sensor_selected(i))
+            continue;
 
-    cairo_move_to(cr, lx, ly + 34);
-    cairo_show_text(cr, "• ADC 0");
+        /* --- Color square --- */
+        cairo_set_source_rgb(cr,
+                             plot_colors[i][0],
+                             plot_colors[i][1],
+                             plot_colors[i][2]);
 
-    cairo_move_to(cr, lx, ly + 50);
-    cairo_show_text(cr, "• ADC 1");
+        cairo_rectangle(cr,
+                        legend_x,
+                        legend_y - box_size + 2,
+                        box_size,
+                        box_size);
+        cairo_fill(cr);
+
+        /* --- Label text (theme color, NOT colored) --- */
+        cairo_set_source_rgba(cr,
+                              fg.red,
+                              fg.green,
+                              fg.blue,
+                              fg.alpha);
+
+        cairo_move_to(cr,
+                      legend_x + box_size + 8,
+                      legend_y + 2);
+
+        cairo_show_text(cr, sensor_labels[i]);
+
+        legend_y += row_spacing;
+    }
+
+    /* ================== Signal Plot Skeleton ================== */
+    for (int i = 0; i < SENSOR_COUNT; i++)
+    {
+        if (!is_sensor_selected(i))
+            continue;
+
+        /*
+         * REAL DATA WILL BE DRAWN HERE LATER
+         *
+         * When backend arrives:
+         *   - use plot_colors[i]
+         *   - draw only for selected sensors
+         *
+         * This conditional is the important part.
+         */
+    }
 
     cairo_set_line_width(cr, 2.5);
 
@@ -553,7 +807,9 @@ int main(int argc, char **argv)
     gtk_window_set_title(GTK_WINDOW(win), "Measurement Network Gateway - GUI");
     gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER);
     gtk_window_set_default_size(GTK_WINDOW(win), 1200, 800);
-    g_signal_connect(win, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+
+    g_signal_connect(win, "delete-event",
+                     G_CALLBACK(on_window_delete), NULL);
 
     GtkWidget *main_v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_container_set_border_width(GTK_CONTAINER(main_v), 16);
@@ -600,7 +856,7 @@ int main(int argc, char **argv)
     GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_box_pack_start(GTK_BOX(right), spacer, TRUE, TRUE, 0);
 
-    GtkWidget *chk_label = gtk_label_new("Signals:");
+    GtkWidget *chk_label = gtk_label_new("SENSORS:");
     gtk_widget_set_halign(chk_label, GTK_ALIGN_END);
     gtk_box_pack_start(GTK_BOX(right), chk_label, FALSE, FALSE, 6);
 
@@ -620,7 +876,7 @@ int main(int argc, char **argv)
     gtk_widget_set_vexpand(secB, TRUE);
     gtk_box_pack_start(GTK_BOX(main_v), secB, TRUE, TRUE, 0);
 
-    GtkWidget *graph_area = gtk_drawing_area_new();
+    graph_area = gtk_drawing_area_new();
     gtk_widget_set_hexpand(graph_area, TRUE);
     gtk_widget_set_vexpand(graph_area, TRUE);
     gtk_container_add(GTK_CONTAINER(secB), graph_area);
@@ -697,6 +953,8 @@ int main(int argc, char **argv)
                      G_CALLBACK(cmd_enter), NULL);
     g_signal_connect(cmd_entry, "focus-out-event",
                      G_CALLBACK(entry_focus_out), NULL);
+    g_signal_connect(cmd_entry, "key-press-event",
+                     G_CALLBACK(cmd_key_press), NULL);
 
     cmd_status = gtk_label_new("");
     gtk_box_pack_start(GTK_BOX(main_v), cmd_status, FALSE, FALSE, 0);
