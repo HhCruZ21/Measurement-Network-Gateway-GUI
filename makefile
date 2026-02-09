@@ -13,7 +13,7 @@ LDFLAGS = $(shell pkg-config --libs gtk+-3.0)
 TARGET = gui_app
 
 # Source files (only gui.c in current directory)
-SRC = gui.c
+SRC = gui.c utils.c
 OBJ = $(SRC:.c=.o)
 
 # Default target - build the application

@@ -1,4 +1,3 @@
-#include <gtk/gtk.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -7,45 +6,17 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/select.h>
-#include <unistd.h>
 #include <errno.h>
-#include <stdint.h>
 #include <pthread.h>
 #include <inttypes.h>
 
 /* ---------- Sensor Model ---------- */
 
-#define PORT 50012
-#define SENSOR_COUNT 5
-#define CMD_HISTORY_SIZE 5
-#define MAX_SAMPLES 1024
+#include "utils.h"
 
-#define TIME_WINDOW_US 5e6 // 5 seconds visible
-#define Y_AXIS_MAX 5.0
-
-
-typedef enum
-{
-    temp_sid = 0,
-    adc_zero_sid,
-    adc_one_sid,
-    sw_sid,
-    pb_sid,
-    snsr_cnt
-} sensor_id_t;
-
-typedef struct
-{
-    sensor_id_t sensor_id;
-    unsigned int sensor_value;
-    uint64_t timestamp;
-} sensor_data_t;
-
-typedef struct
-{
-    uint32_t sensor_id;
-    uint32_t rate_hz;
-} sensor_rate_t;
+void push_sample(int sid, double value, uint64_t ts);
+static void *net_rx_thread(void *arg);
+static int recv_all(int fd, void *buf, size_t len);
 
 static uint64_t sample_ts[SENSOR_COUNT][MAX_SAMPLES];
 static uint64_t first_ts = 0;
@@ -54,12 +25,6 @@ static uint64_t session_t0 = 0;
 
 static uint64_t global_t_min = UINT64_MAX;
 static uint64_t global_t_max = 0;
-
-static gboolean is_valid_ipv4(const char *ip);
-static void set_enabled(GtkWidget *w, gboolean e);
-void push_sample(int sid, double value, uint64_t ts);
-static void *net_rx_thread(void *arg);
-static int recv_all(int fd, void *buf, size_t len);
 
 static gboolean suppress_checkbox_cb = FALSE;
 
@@ -117,14 +82,6 @@ static const char *canonical_sensor(const char *s)
 /* ---------- State ---------- */
 
 GtkWidget *graph_area;
-
-typedef enum
-{
-    STATE_DISCONNECTED,
-    STATE_CONNECTED,
-    STATE_RUNNING
-} AppState;
-
 static AppState state = STATE_DISCONNECTED;
 
 /* ---------- Widgets ---------- */
@@ -151,38 +108,6 @@ static void reset_plot_state(void)
         sample_count[s] = 0;
         sample_head[s] = 0;
     }
-}
-
-static void load_css(void)
-{
-    GtkCssProvider *provider = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(provider,
-                                    /* Command feedback */
-                                    "entry.cmd-success {\n"
-                                    "  border: 2px solid #2ecc71;\n"
-                                    "  box-shadow: none;\n"
-                                    "}\n"
-                                    "entry.cmd-error {\n"
-                                    "  border: 2px solid #e74c3c;\n"
-                                    "  box-shadow: none;\n"
-                                    "}\n"
-                                    ".text-green { color: #2ecc71; }\n"
-                                    ".text-red   { color: #e74c3c; }\n"
-
-                                    /* Clean blue focus (NO theme bleed) */
-                                    "entry:focus:not(.cmd-success):not(.cmd-error) {\n"
-                                    "  border: 2px solid #3399ff;\n"
-                                    "  outline: none;\n"
-                                    "  box-shadow: none;\n"
-                                    "  background-clip: padding-box;\n"
-                                    "}\n",
-
-                                    -1, NULL);
-
-    gtk_style_context_add_provider_for_screen(
-        gdk_screen_get_default(),
-        GTK_STYLE_PROVIDER(provider),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 }
 
 /* ---------- Utilities ---------- */
@@ -224,35 +149,6 @@ static void apply_state()
     set_enabled(config_btn,
                 running && strlen(gtk_entry_get_text(GTK_ENTRY(hz_entry))) > 0);
     set_enabled(cmd_entry, running);
-}
-
-static gboolean is_valid_ipv4(const char *ip)
-{
-    if (!ip || !*ip)
-        return FALSE;
-
-    int a, b, c, d;
-    char tail;
-
-    /* Strict format: a.b.c.d and nothing else */
-    if (sscanf(ip, "%d.%d.%d.%d%c", &a, &b, &c, &d, &tail) != 4)
-        return FALSE;
-
-    if (a < 0 || a > 255)
-        return FALSE;
-    if (b < 0 || b > 255)
-        return FALSE;
-    if (c < 0 || c > 255)
-        return FALSE;
-    if (d < 0 || d > 255)
-        return FALSE;
-
-    return TRUE;
-}
-
-static void set_enabled(GtkWidget *w, gboolean e)
-{
-    gtk_widget_set_sensitive(w, e);
 }
 
 static int checked_count()
