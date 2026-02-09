@@ -21,6 +21,8 @@
 #define MAX_SAMPLES 1024
 
 #define TIME_WINDOW_US 5e6 // 5 seconds visible
+#define Y_AXIS_MAX 5.0
+
 
 typedef enum
 {
@@ -39,15 +41,23 @@ typedef struct
     uint64_t timestamp;
 } sensor_data_t;
 
+typedef struct
+{
+    uint32_t sensor_id;
+    uint32_t rate_hz;
+} sensor_rate_t;
+
 static uint64_t sample_ts[SENSOR_COUNT][MAX_SAMPLES];
 static uint64_t first_ts = 0;
 
-static uint64_t global_t_min = 0;
+static uint64_t session_t0 = 0;
+
+static uint64_t global_t_min = UINT64_MAX;
 static uint64_t global_t_max = 0;
 
 static gboolean is_valid_ipv4(const char *ip);
 static void set_enabled(GtkWidget *w, gboolean e);
-void push_sample(int sid, double value);
+void push_sample(int sid, double value, uint64_t ts);
 static void *net_rx_thread(void *arg);
 static int recv_all(int fd, void *buf, size_t len);
 
@@ -64,6 +74,15 @@ static char connected_ip[64] = {0};
 static char *cmd_history[CMD_HISTORY_SIZE];
 static int cmd_hist_count = 0;
 static int cmd_hist_index = -1;
+
+/* ---------- Per-sensor Y scaling ---------- */
+static const double sensor_y_max[SENSOR_COUNT] = {
+    1024.0, // Temp (raw RTD-ish)
+    4095.0, // ADC 0
+    4095.0, // ADC 1
+    255.0,  // Switches
+    1.0     // Push buttons
+};
 
 const char *sensor_ids[SENSOR_COUNT] = {
     "TEMP", "ADC0", "ADC1", "SW", "PB"};
@@ -120,6 +139,19 @@ GtkWidget *cmd_entry, *cmd_status;
 GHashTable *sensor_freq;
 
 /* ---------- CSS ---------- */
+
+static void reset_plot_state(void)
+{
+    session_t0 = 0;
+    global_t_min = UINT64_MAX;
+    global_t_max = 0;
+
+    for (int s = 0; s < SENSOR_COUNT; s++)
+    {
+        sample_count[s] = 0;
+        sample_head[s] = 0;
+    }
+}
 
 static void load_css(void)
 {
@@ -314,7 +346,7 @@ static void *net_rx_thread(void *arg)
 
         if (pkt.sensor_id < SENSOR_COUNT)
         {
-            push_sample(pkt.sensor_id, pkt.sensor_value);
+            push_sample(pkt.sensor_id, pkt.sensor_value, pkt.timestamp);
             g_idle_add(redraw_graph, NULL);
         }
     }
@@ -345,9 +377,14 @@ static void update_dropdown()
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
 }
 
-void push_sample(int sid, double value)
+void push_sample(int sid, double value, uint64_t ts)
 {
-    uint64_t ts = g_get_monotonic_time();
+    /* Initialize session time origin */
+    if (session_t0 == 0)
+        session_t0 = ts;
+
+    /* Normalize timestamp to session time */
+    ts -= session_t0;
 
     sample_data[sid][sample_head[sid]] = value;
     sample_ts[sid][sample_head[sid]] = ts;
@@ -359,7 +396,7 @@ void push_sample(int sid, double value)
 
     /* ---------- Incremental time window tracking ---------- */
 
-    if (global_t_min == 0 || ts < global_t_min)
+    if (ts < global_t_min)
         global_t_min = ts;
 
     if (ts > global_t_max)
@@ -672,6 +709,8 @@ static void connect_clicked(GtkButton *b, gpointer d)
 
     printf("Connected to server %s\n", ip);
 
+    reset_plot_state();
+
     strncpy(connected_ip, ip, sizeof(connected_ip) - 1);
     connected_ip[sizeof(connected_ip) - 1] = '\0';
 
@@ -739,6 +778,7 @@ static gboolean on_window_delete(GtkWidget *widget,
         sock_fd = -1;
         printf("Client socket closed (on exit)\n");
     }
+    reset_plot_state();
 
     gtk_main_quit();
 
@@ -761,6 +801,7 @@ static void disconnect_clicked(GtkButton *b, gpointer d)
         sock_fd = -1;
         printf("Disconnected from server\n");
     }
+    reset_plot_state();
 
     state = STATE_DISCONNECTED;
     apply_state();
@@ -773,6 +814,47 @@ static void start_clicked(GtkButton *b, gpointer d)
 
     send(sock_fd, "START\n", 6, 0);
     printf("Sent START\n");
+
+    char hdr[6]; // +1 for null terminator
+
+    if (recv_all(sock_fd, hdr, 6) < 0 ||
+        memcmp(hdr, "RATES\n", 6) != 0)
+    {
+        printf("ERROR: invalid RATES header\n");
+        return;
+    }
+
+    sensor_rate_t rates[SENSOR_COUNT];
+
+    if (recv_all(sock_fd, rates, sizeof(rates)) < 0)
+    {
+        printf("ERROR: failed to receive sensor rates\n");
+        return;
+    }
+
+    /* Store rates in model */
+    for (int i = 0; i < SENSOR_COUNT; i++)
+    {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%u", rates[i].rate_hz);
+
+        g_hash_table_replace(sensor_freq,
+                             g_strdup(sensor_ids[rates[i].sensor_id]),
+                             g_strdup(buf));
+
+        printf("[GUI] Sensor %s -> %s Hz\n",
+               sensor_ids[rates[i].sensor_id], buf);
+    }
+
+    /* Update Hz entry for active sensor */
+    const char *active =
+        gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
+
+    if (active)
+    {
+        const char *val = g_hash_table_lookup(sensor_freq, active);
+        gtk_entry_set_text(GTK_ENTRY(hz_entry), val ? val : "");
+    }
 
     net_running = 1;
     pthread_create(&net_thread, NULL, net_rx_thread, NULL);
@@ -862,39 +944,39 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     plot_h = height - bottom_margin - 10;
 
     /* ================== Time Window (global, incremental) ================== */
-    if (global_t_max <= global_t_min)
+    if (global_t_min == UINT64_MAX || global_t_max <= global_t_min)
         return FALSE;
 
-    uint64_t t_min = global_t_min;
     uint64_t t_max = global_t_max;
+    uint64_t t_min = global_t_min;
 
-    /* ================== Y-axis Auto Scaling ================== */
-    double y_max = 1.0; // avoid divide-by-zero
+    /* Clamp to sliding window */
+    if (t_max - t_min > TIME_WINDOW_US)
+        t_min = t_max - TIME_WINDOW_US;
 
-    for (int s = 0; s < SENSOR_COUNT; s++)
-    {
-        if (!is_sensor_selected(s))
-            continue;
+    /* Find earliest visible timestamp from actual samples */
+    // for (int s = 0; s < SENSOR_COUNT; s++)
+    // {
+    //     if (!is_sensor_selected(s))
+    //         continue;
 
-        int count = sample_count[s];
-        int head = sample_head[s];
+    //     int count = sample_count[s];
+    //     int head = sample_head[s];
+    //     int start = (head - count + MAX_SAMPLES) % MAX_SAMPLES;
 
-        for (int i = 0; i < count; i++)
-        {
-            int idx = (head + i) % MAX_SAMPLES;
-            double v = sample_data[s][idx];
+    //     for (int i = 0; i < count; i++)
+    //     {
+    //         int idx = (start + i) % MAX_SAMPLES;
+    //         uint64_t ts = sample_ts[s][idx];
 
-            if (v > y_max)
-                y_max = v;
-        }
-    }
+    //         if (ts >= t_max - TIME_WINDOW_US && ts < t_min)
+    //             t_min = ts;
+    //     }
+    // }
 
-    /* Round y_max up to a nice grid value */
-    double grid_step = 1.0;
-    while (grid_step * 10.0 < y_max)
-        grid_step *= 10.0;
-
-    y_max = ceil(y_max / grid_step) * grid_step;
+    /* Safety: ensure non-zero span */
+    if (t_max <= t_min)
+        return FALSE;
 
     /* ================== Faint Grid ================== */
     cairo_set_source_rgba(cr, 0.7, 0.7, 0.7, 0.1);
@@ -909,11 +991,11 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
 
     /* Horizontal grid lines */
     /* Horizontal grid lines + Y labels */
-    int grid_count = (height - bottom_margin) / grid_spacing;
+    int grid_count = plot_h / grid_spacing;
 
     for (int i = 0; i <= grid_count; i++)
     {
-        double y = i * grid_spacing;
+        double y = (height - bottom_margin) - i * grid_spacing;
 
         cairo_move_to(cr, left_margin, y + 0.5);
         cairo_line_to(cr, left_margin + plot_w, y + 0.5);
@@ -935,16 +1017,16 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
 
     cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, fg.alpha);
 
-    /* Y-axis labels */
+    /* ================== Normalized Y-axis ticks (0.0 – 1.0) ================== */
     cairo_set_font_size(cr, 11);
 
     for (int i = 0; i <= grid_count; i++)
     {
-        double y = i * grid_spacing;
-        double val = y_max * (1.0 - (double)i / grid_count);
+        double y = (height - bottom_margin) - i * grid_spacing;
+        double value = Y_AXIS_MAX * (double)i / grid_count;
 
-        char label[32];
-        snprintf(label, sizeof(label), "%.0f", val);
+        char label[16];
+        snprintf(label, sizeof(label), "%.1f", value);
 
         cairo_text_extents_t ext;
         cairo_text_extents(cr, label, &ext);
@@ -954,6 +1036,8 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
                       y + ext.height / 2);
         cairo_show_text(cr, label);
     }
+
+    /* Y-axis labels */
 
     cairo_stroke(cr);
 
@@ -989,9 +1073,13 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
         int head = sample_head[s];
         int count = sample_count[s];
 
+        int start = (head - count + MAX_SAMPLES) % MAX_SAMPLES;
+
+        gboolean started = FALSE;
+
         for (int i = 0; i < count; i++)
         {
-            int idx = (head + i) % MAX_SAMPLES;
+            int idx = (start + i) % MAX_SAMPLES;
             double v = sample_data[s][idx];
 
             uint64_t ts = sample_ts[s][idx];
@@ -1007,12 +1095,26 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
                        plot_w * (double)(ts - t_min) / span;
 
             /* ADC-style scaling (0–4095) */
-            double y = plot_h * (1.0 - v / y_max);
+            double norm = v / sensor_y_max[s];
 
-            if (i == 0)
+            /* Clamp to [0, 1] to avoid visual artifacts */
+            if (norm < 0.0)
+                norm = 0.0;
+            else if (norm > 1.0)
+                norm = 1.0;
+
+            double y = (height - bottom_margin) -
+                       (plot_h * norm);
+
+            if (!started)
+            {
                 cairo_move_to(cr, x, y);
+                started = TRUE;
+            }
             else
+            {
                 cairo_line_to(cr, x, y);
+            }
         }
 
         cairo_stroke(cr);
