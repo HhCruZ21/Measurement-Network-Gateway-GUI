@@ -41,6 +41,14 @@ typedef enum
     STATE_RUNNING
 } AppState;
 
+typedef struct
+{
+    GtkWidget *entry;
+    GtkWidget *label;
+} CmdClearCtx;
+
 gboolean is_valid_ipv4(const char *ip);
 void set_enabled(GtkWidget *w, gboolean e);
 void load_css(void);
+
+gboolean clear_cmd_feedback(gpointer data);

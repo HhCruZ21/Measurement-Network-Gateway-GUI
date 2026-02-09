@@ -60,3 +60,30 @@ void load_css(void)
         GTK_STYLE_PROVIDER(provider),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 }
+
+gboolean clear_cmd_feedback(gpointer data)
+{
+    CmdClearCtx *ctx = data;
+
+    GtkStyleContext *ec = gtk_widget_get_style_context(ctx->entry);
+    GtkStyleContext *lc = gtk_widget_get_style_context(ctx->label);
+
+    gtk_style_context_remove_class(ec, "cmd-success");
+    gtk_style_context_remove_class(ec, "cmd-error");
+    gtk_style_context_remove_class(lc, "text-green");
+    gtk_style_context_remove_class(lc, "text-red");
+
+    gtk_label_set_text(GTK_LABEL(ctx->label), "");
+
+    /* RESET command icon to idle */
+    gtk_entry_set_icon_from_icon_name(
+        GTK_ENTRY(ctx->entry),
+        GTK_ENTRY_ICON_PRIMARY,
+        "utilities-terminal-symbolic");
+
+    gtk_entry_set_text(GTK_ENTRY(ctx->entry), "");
+    gtk_widget_set_sensitive(ctx->entry, TRUE);
+
+    g_free(ctx);
+    return FALSE;
+}

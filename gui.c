@@ -421,39 +421,6 @@ static void configure_clicked(GtkButton *b, gpointer d)
 
 /* ---------- Command Line ---------- */
 
-typedef struct
-{
-    GtkWidget *entry;
-    GtkWidget *label;
-} CmdClearCtx;
-
-static gboolean clear_cmd_feedback(gpointer data)
-{
-    CmdClearCtx *ctx = data;
-
-    GtkStyleContext *ec = gtk_widget_get_style_context(ctx->entry);
-    GtkStyleContext *lc = gtk_widget_get_style_context(ctx->label);
-
-    gtk_style_context_remove_class(ec, "cmd-success");
-    gtk_style_context_remove_class(ec, "cmd-error");
-    gtk_style_context_remove_class(lc, "text-green");
-    gtk_style_context_remove_class(lc, "text-red");
-
-    gtk_label_set_text(GTK_LABEL(ctx->label), "");
-
-    /* RESET command icon to idle */
-    gtk_entry_set_icon_from_icon_name(
-        GTK_ENTRY(ctx->entry),
-        GTK_ENTRY_ICON_PRIMARY,
-        "utilities-terminal-symbolic");
-
-    gtk_entry_set_text(GTK_ENTRY(ctx->entry), "");
-    gtk_widget_set_sensitive(ctx->entry, TRUE);
-
-    g_free(ctx);
-    return FALSE;
-}
-
 static void cmd_enter(GtkEntry *e, gpointer d)
 {
     char buf[128];
@@ -616,9 +583,7 @@ static void connect_clicked(GtkButton *b, gpointer d)
     apply_state();
 }
 
-static gboolean on_window_delete(GtkWidget *widget,
-                                 GdkEvent *event,
-                                 gpointer user_data)
+static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer user_data)
 {
     /* If not connected, allow close immediately */
     if (state == STATE_DISCONNECTED)
