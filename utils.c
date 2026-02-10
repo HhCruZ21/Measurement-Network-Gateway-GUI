@@ -1,5 +1,7 @@
 #include "utils.h"
 
+uint64_t time_window_us = 5000000ULL; // default: 5s fallback
+
 gboolean is_valid_ipv4(const char *ip)
 {
     if (!ip || !*ip)

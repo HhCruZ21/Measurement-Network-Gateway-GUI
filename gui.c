@@ -14,9 +14,15 @@
 
 #include "utils.h"
 
+#define VISIBLE_CYCLES 5
+#define VISIBLE_SAMPLES 300
+#define MIN_WINDOW_US 50000ULL   // 50 ms
+#define MAX_WINDOW_US 5000000ULL // 5 s
+
 void push_sample(int sid, double value, uint64_t ts);
 static void *net_rx_thread(void *arg);
 static int recv_all(int fd, void *buf, size_t len);
+static void set_connect_status(const char *msg, const char *color);
 
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -56,6 +62,7 @@ const char *sensor_labels[SENSOR_COUNT] = {
 static double sample_data[SENSOR_COUNT][MAX_SAMPLES];
 static int sample_count[SENSOR_COUNT] = {0};
 static int sample_head[SENSOR_COUNT] = {0};
+static guint connect_status_timeout_id = 0;
 
 /* Plot colors (Matplotlib default palette) */
 static const double plot_colors[SENSOR_COUNT][3] = {
@@ -86,6 +93,8 @@ static AppState state = STATE_DISCONNECTED;
 
 GtkWidget *connect_entry, *connect_btn, *disconnect_btn, *shutdown_btn;
 GtkWidget *start_btn, *stop_btn;
+GtkWidget *connect_status_label;
+
 GtkWidget *checkboxes[SENSOR_COUNT];
 GtkWidget *combo;
 GtkWidget *hz_entry, *config_btn;
@@ -107,7 +116,6 @@ static void reset_plot_state(void)
 }
 
 /* ---------- Utilities ---------- */
-
 static void apply_state()
 {
     gboolean connected = (state != STATE_DISCONNECTED);
@@ -145,6 +153,31 @@ static void apply_state()
     set_enabled(config_btn,
                 running && strlen(gtk_entry_get_text(GTK_ENTRY(hz_entry))) > 0);
     set_enabled(cmd_entry, running);
+}
+
+static gboolean handle_connection_lost(gpointer data)
+{
+    (void)data;
+
+    if (net_running)
+        net_running = 0;
+
+    if (sock_fd >= 0)
+    {
+        close(sock_fd);
+        sock_fd = -1;
+    }
+
+    reset_plot_state();
+
+    state = STATE_DISCONNECTED;
+
+    set_connect_status("Connection lost", "red");
+    apply_state();
+
+    printf("[GUI] Connection lost → auto-disconnected\n");
+
+    return G_SOURCE_REMOVE; // run once
 }
 
 static int checked_count()
@@ -234,7 +267,13 @@ static void *net_rx_thread(void *arg)
 
         ssize_t n = recv(sock_fd, &pkt, sizeof(pkt), 0);
         if (n <= 0)
-            break; // server closed or error
+        {
+            printf("[NET] Server disconnected (recv=%zd)\n", n);
+
+            /* Notify GTK main thread */
+            g_idle_add(handle_connection_lost, NULL);
+            break;
+        }
 
         if (pkt.sensor_id < SENSOR_COUNT)
         {
@@ -360,8 +399,41 @@ static void checkbox_changed(GtkToggleButton *btn, gpointer d)
 
 static void hz_changed(GtkEditable *e, gpointer d)
 {
-    set_enabled(config_btn,
-                strlen(gtk_entry_get_text(GTK_ENTRY(hz_entry))) > 0);
+    const char *txt = gtk_entry_get_text(GTK_ENTRY(hz_entry));
+
+    gboolean valid = TRUE;
+
+    if (!txt || !*txt)
+        valid = FALSE;
+    else
+    {
+        /* numeric check */
+        for (int i = 0; txt[i]; i++)
+        {
+            if (!isdigit((unsigned char)txt[i]))
+            {
+                valid = FALSE;
+                break;
+            }
+        }
+
+        if (valid)
+        {
+            int val = atoi(txt);
+            if (val < 10 || val > 1000)
+                valid = FALSE;
+        }
+    }
+
+    GtkStyleContext *ctx =
+        gtk_widget_get_style_context(hz_entry);
+
+    gtk_style_context_remove_class(ctx, "cmd-error");
+
+    if (!valid && txt && *txt)
+        gtk_style_context_add_class(ctx, "cmd-error");
+
+    set_enabled(config_btn, valid);
 }
 
 static void configure_clicked(GtkButton *b, gpointer d)
@@ -385,7 +457,7 @@ static void configure_clicked(GtkButton *b, gpointer d)
     }
 
     int rate = atoi(freq);
-    if (rate <= 0)
+    if (rate < 10 || rate > 1000)
         return;
 
     /* send to server */
@@ -404,11 +476,76 @@ static void configure_clicked(GtkButton *b, gpointer d)
 
 /* ---------- Command Line ---------- */
 
+static void open_help_terminal(void)
+{
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+             "cat << 'EOF'\n%s\nEOF\n"
+             "echo\n"
+             "read -p 'Press Enter to close...'\n",
+             HELP_TEXT);
+
+    char *argv[] = {
+        "x-terminal-emulator",
+        "-e",
+        "bash",
+        "-c",
+        cmd,
+        NULL};
+
+    g_spawn_async(NULL, argv, NULL,
+                  G_SPAWN_SEARCH_PATH,
+                  NULL, NULL, NULL, NULL);
+}
+
 static void cmd_enter(GtkEntry *e, gpointer d)
 {
     char buf[128];
     strncpy(buf, gtk_entry_get_text(e), sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = 0;
+
+    char *raw = g_strdup(gtk_entry_get_text(e));
+    g_strstrip(raw);
+
+    if (g_ascii_strcasecmp(raw, "HELP") == 0)
+    {
+        open_help_terminal();
+
+        /* ---- ADD THIS BLOCK ---- */
+        if (cmd_hist_count < CMD_HISTORY_SIZE)
+        {
+            cmd_history[cmd_hist_count++] = g_strdup("HELP");
+        }
+        else
+        {
+            g_free(cmd_history[0]);
+            memmove(&cmd_history[0], &cmd_history[1],
+                    (CMD_HISTORY_SIZE - 1) * sizeof(char *));
+            cmd_history[CMD_HISTORY_SIZE - 1] = g_strdup("HELP");
+        }
+        cmd_hist_index = cmd_hist_count;
+
+        gtk_entry_set_icon_from_icon_name(
+            GTK_ENTRY(e),
+            GTK_ENTRY_ICON_PRIMARY,
+            "help-browser-symbolic");
+
+        gtk_label_set_text(GTK_LABEL(cmd_status),
+                           "Help opened in terminal");
+
+        gtk_widget_set_sensitive(GTK_WIDGET(e), FALSE);
+
+        g_free(raw);
+
+        CmdClearCtx *ctx = g_malloc(sizeof(CmdClearCtx));
+        ctx->entry = GTK_WIDGET(e);
+        ctx->label = cmd_status;
+        g_timeout_add(3000, clear_cmd_feedback, ctx);
+
+        return;
+    }
+
+    g_free(raw);
 
     char *tok1 = strtok(buf, " ");
     char *tok2 = strtok(NULL, " ");
@@ -416,46 +553,81 @@ static void cmd_enter(GtkEntry *e, gpointer d)
     char *extra = strtok(NULL, " ");
 
     gboolean valid = FALSE;
+    CmdError err = CMD_ERR_SYNTAX;
     const char *id = NULL;
 
-    if (tok1 && tok2 && tok3 && !extra &&
-        g_ascii_strcasecmp(tok1, "CONFIGURE") == 0 &&
-        (id = canonical_sensor(tok2)))
+    if (!tok1 || !tok2 || !tok3 || extra ||
+        g_ascii_strcasecmp(tok1, "CONFIGURE") != 0)
     {
-        /* validate numeric rate */
-        for (int i = 0; tok3[i]; i++)
+        err = CMD_ERR_SYNTAX;
+        goto done;
+    }
+
+    id = canonical_sensor(tok2);
+    if (!id)
+    {
+        err = CMD_ERR_SENSOR;
+        goto done;
+    }
+
+    /* numeric check */
+    for (int i = 0; tok3[i]; i++)
+    {
+        if (!isdigit((unsigned char)tok3[i]))
         {
-            if (!isdigit((unsigned char)tok3[i]))
-                goto done;
-        }
-
-        int rate = atoi(tok3);
-        if (rate > 0)
-        {
-            valid = TRUE;
-
-            /* update local model */
-            g_hash_table_replace(sensor_freq,
-                                 g_strdup(id),
-                                 g_strdup(tok3));
-
-            /* update Hz entry if same sensor selected */
-            const char *active =
-                gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
-            if (active && strcmp(active, id) == 0)
-                gtk_entry_set_text(GTK_ENTRY(hz_entry), tok3);
-
-            /* send to server */
-            if (sock_fd >= 0)
-            {
-                char net_cmd[64];
-                snprintf(net_cmd, sizeof(net_cmd),
-                         "CONFIGURE %s %d\n", id, rate);
-                send(sock_fd, net_cmd, strlen(net_cmd), 0);
-                printf("Sent: %s", net_cmd);
-            }
+            err = CMD_ERR_FREQ_RANGE;
+            goto done;
         }
     }
+
+    int rate = atoi(tok3);
+    if (rate < 10 || rate > 1000)
+    {
+        err = CMD_ERR_FREQ_RANGE;
+        goto done;
+    }
+
+    /* ---- SUCCESS ---- */
+    valid = TRUE;
+    err = CMD_OK;
+
+    // if (!tok1 || !tok2 || !tok3 || extra ||
+    // g_ascii_strcasecmp(tok1, "CONFIGURE") != 0)
+    // {
+    //     /* validate numeric rate */
+    //     for (int i = 0; tok3[i]; i++)
+    //     {
+    //         if (!isdigit((unsigned char)tok3[i]))
+    //             goto done;
+    //     }
+
+    //     int rate = atoi(tok3);
+    //     if (rate >= 10 && rate <= 1000)
+    //     {
+    //         valid = TRUE;
+
+    /* update local model */
+    g_hash_table_replace(sensor_freq,
+                         g_strdup(id),
+                         g_strdup(tok3));
+
+    /* update Hz entry if same sensor selected */
+    const char *active =
+        gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
+    if (active && strcmp(active, id) == 0)
+        gtk_entry_set_text(GTK_ENTRY(hz_entry), tok3);
+
+    /* send to server */
+    if (sock_fd >= 0)
+    {
+        char net_cmd[64];
+        snprintf(net_cmd, sizeof(net_cmd),
+                 "CONFIGURE %s %d\n", id, rate);
+        send(sock_fd, net_cmd, strlen(net_cmd), 0);
+        printf("Sent: %s", net_cmd);
+    }
+    //     }
+    // }
 
 done:;
     GtkStyleContext *ec = gtk_widget_get_style_context(GTK_WIDGET(e));
@@ -470,7 +642,7 @@ done:;
     {
         gtk_style_context_add_class(ec, "cmd-success");
         gtk_style_context_add_class(lc, "text-green");
-        gtk_label_set_text(GTK_LABEL(cmd_status), "command executed");
+        gtk_label_set_text(GTK_LABEL(cmd_status), "Command executed");
 
         /* Success icon */
         gtk_entry_set_icon_from_icon_name(
@@ -498,7 +670,18 @@ done:;
     {
         gtk_style_context_add_class(ec, "cmd-error");
         gtk_style_context_add_class(lc, "text-red");
-        gtk_label_set_text(GTK_LABEL(cmd_status), "command execution failed");
+        switch (err)
+        {
+        case CMD_ERR_FREQ_RANGE:
+            gtk_label_set_text(GTK_LABEL(cmd_status),
+                               "Command execution failed. Valid frequency is between 10 and 1000 Hz. Use help command for info.");
+            break;
+
+        default:
+            gtk_label_set_text(GTK_LABEL(cmd_status),
+                               "Command execution failed. Use help command for info");
+            break;
+        }
 
         /* Error icon */
         gtk_entry_set_icon_from_icon_name(
@@ -518,6 +701,44 @@ done:;
 /* ---------- State Machine ---------- */
 
 /* ---------- Buttons ---------- */
+static gboolean clear_connect_status(gpointer data)
+{
+    GtkWidget *label = GTK_WIDGET(data);
+    gtk_label_set_text(GTK_LABEL(label), "");
+    connect_status_timeout_id = 0;
+    return G_SOURCE_REMOVE; // run once
+}
+
+static void set_connect_status(const char *msg, const char *color)
+{
+    if (!msg || !*msg)
+    {
+        gtk_label_set_text(GTK_LABEL(connect_status_label), "");
+        return;
+    }
+    char markup[256];
+
+    /* Cancel previous timeout if any */
+    if (connect_status_timeout_id)
+    {
+        g_source_remove(connect_status_timeout_id);
+        connect_status_timeout_id = 0;
+    }
+
+    /* Set text */
+    snprintf(markup, sizeof(markup),
+             "<span foreground=\"%s\"><b>%s</b></span>",
+             color, msg);
+    gtk_label_set_markup(GTK_LABEL(connect_status_label), markup);
+
+    /* Arm auto-clear (only if non-empty message) */
+    if (msg && *msg)
+    {
+        connect_status_timeout_id =
+            g_timeout_add(5000, clear_connect_status,
+                          connect_status_label);
+    }
+}
 
 static void connect_clicked(GtkButton *b, gpointer d)
 {
@@ -525,10 +746,13 @@ static void connect_clicked(GtkButton *b, gpointer d)
     if (!ip || !*ip)
         return;
 
+    set_connect_status("", "black");
+
     sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd < 0)
     {
         perror("socket");
+        set_connect_status("Socket creation failed!", "red");
         return;
     }
 
@@ -540,6 +764,7 @@ static void connect_clicked(GtkButton *b, gpointer d)
     if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1)
     {
         perror("inet_pton");
+        set_connect_status("IP not found!", "red");
         close(sock_fd);
         sock_fd = -1;
         return;
@@ -548,12 +773,16 @@ static void connect_clicked(GtkButton *b, gpointer d)
     if (connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
         perror("connect");
+        set_connect_status(
+            "Connect failed, check if server is running",
+            "red");
         close(sock_fd);
         sock_fd = -1;
         return;
     }
 
     printf("Connected to server %s\n", ip);
+    set_connect_status("Connection successful", "green");
 
     reset_plot_state();
 
@@ -648,6 +877,7 @@ static void disconnect_clicked(GtkButton *b, gpointer d)
     reset_plot_state();
 
     state = STATE_DISCONNECTED;
+    set_connect_status("", "black");
     apply_state();
 }
 
@@ -688,6 +918,31 @@ static void start_clicked(GtkButton *b, gpointer d)
 
         printf("[GUI] Sensor %s -> %s Hz\n",
                sensor_ids[rates[i].sensor_id], buf);
+
+        /* === Dynamic time window based on ADC frequency === */
+        if (rates[i].sensor_id == adc_zero_sid &&
+            rates[i].rate_hz > 0)
+        {
+            if (rates[i].sensor_id == adc_zero_sid &&
+                rates[i].rate_hz > 0)
+            {
+                double sample_period_us = 1e6 / rates[i].rate_hz;
+
+                time_window_us =
+                    (uint64_t)(VISIBLE_SAMPLES * sample_period_us);
+
+                if (time_window_us < MIN_WINDOW_US)
+                    time_window_us = MIN_WINDOW_US;
+                if (time_window_us > MAX_WINDOW_US)
+                    time_window_us = MAX_WINDOW_US;
+
+                printf("[GUI] Time window set to %.2f ms\n",
+                       time_window_us / 1000.0);
+            }
+
+            printf("[GUI] Time window set to %.2f ms\n",
+                   time_window_us / 1000.0);
+        }
     }
 
     /* Update Hz entry for active sensor */
@@ -792,7 +1047,7 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     pthread_mutex_unlock(&sample_lock);
 
     uint64_t t_min =
-        (t_max > TIME_WINDOW_US) ? (t_max - TIME_WINDOW_US) : 0;
+        (t_max > time_window_us) ? (t_max - time_window_us) : 0;
 
     for (int s = 0; s < SENSOR_COUNT; s++)
         visible_count[s] = 0;
@@ -938,9 +1193,31 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
         for (int i = 0; i < n; i++)
         {
             double x = left_margin +
-                       plot_w * (double)i / (double)(n - 1);
+                       plot_w *
+                           (double)(visible_ts[i] - t_min) /
+                           (double)(time_window_us);
+
+            if (x < left_margin)
+                continue;
+            if (x > left_margin + plot_w)
+                break;
 
             double v = visible_val[s][i];
+
+            static double last_v = 0;
+            static uint64_t last_peak_ts = 0;
+
+            if (last_v < 2048 && v >= 2048) // rising zero-cross (rough)
+            {
+                if (last_peak_ts != 0)
+                {
+                    printf("Δt = %.2f ms\n",
+                           (visible_ts[i] - last_peak_ts) / 1000.0);
+                }
+                last_peak_ts = visible_ts[i];
+            }
+
+            last_v = v;
 
             /* ADC-style scaling (0–4095) */
             double norm = v / sensor_y_max[s];
@@ -1124,8 +1401,7 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     for (int i = 0; i <= tick_count; i++)
     {
         double x = left_margin + i * grid_spacing;
-        int idx = (visible_count[ref_sensor] - 1) * i / tick_count;
-        uint64_t t = visible_ts[idx];
+        uint64_t t = t_min + (time_window_us * i) / tick_count;
 
         /* Tick mark */
         cairo_move_to(cr, x + 0.5, height - bottom_margin);
@@ -1223,21 +1499,38 @@ int main(int argc, char **argv)
     gtk_container_add(GTK_CONTAINER(win), main_v);
 
     /* Section A */
-    GtkWidget *secA = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *secA = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_box_pack_start(GTK_BOX(main_v), secA, FALSE, FALSE, 0);
 
-    GtkWidget *left = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_box_pack_start(GTK_BOX(secA), left, FALSE, FALSE, 0);
+    /* ---- Top row: buttons + sensors ---- */
+    GtkWidget *top_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(secA), top_row, FALSE, FALSE, 0);
 
-    connect_entry = gtk_entry_new();
+    GtkWidget *left = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_pack_start(GTK_BOX(top_row), left, FALSE, FALSE, 0);
+
     GtkWidget *cnk_label = gtk_label_new("Enter Server IP:");
     gtk_widget_set_halign(cnk_label, GTK_ALIGN_END);
     gtk_box_pack_start(GTK_BOX(left), cnk_label, FALSE, FALSE, 6);
 
+    /* IP entry (inline with label and buttons) */
+    connect_entry = gtk_entry_new();
     gtk_entry_set_width_chars(GTK_ENTRY(connect_entry), 20);
     gtk_box_pack_start(GTK_BOX(left), connect_entry, FALSE, FALSE, 0);
     g_signal_connect(connect_entry, "focus-out-event",
                      G_CALLBACK(entry_focus_out), NULL);
+
+    /* ---- connection status (below entire row) ---- */
+    GtkWidget *ip_column = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_box_pack_start(GTK_BOX(secA), ip_column, FALSE, FALSE, 0);
+    gtk_widget_set_margin_start(ip_column, 120);
+
+    /* Connection status label (below IP entry) */
+    connect_status_label = gtk_label_new("");
+    gtk_widget_set_halign(connect_status_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(ip_column),
+                       connect_status_label,
+                       FALSE, FALSE, 0);
 
     GtkWidget *space_conn = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_box_pack_start(GTK_BOX(left), space_conn, FALSE, FALSE, 0);
@@ -1262,9 +1555,7 @@ int main(int argc, char **argv)
     gtk_box_pack_start(GTK_BOX(left), shutdown_btn, FALSE, FALSE, 0);
 
     GtkWidget *right = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-
-    /* This box expands and takes all remaining space */
-    gtk_box_pack_start(GTK_BOX(secA), right, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(top_row), right, TRUE, TRUE, 0);
 
     /* Filler to push content to the right */
     GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
