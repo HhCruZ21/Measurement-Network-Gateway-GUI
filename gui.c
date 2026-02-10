@@ -18,13 +18,11 @@ void push_sample(int sid, double value, uint64_t ts);
 static void *net_rx_thread(void *arg);
 static int recv_all(int fd, void *buf, size_t len);
 
+static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static uint64_t sample_ts[SENSOR_COUNT][MAX_SAMPLES];
-static uint64_t first_ts = 0;
 
-static uint64_t session_t0 = 0;
-
-static uint64_t global_t_min = UINT64_MAX;
-static uint64_t global_t_max = 0;
+static uint64_t server_t0 = 0;
 
 static gboolean suppress_checkbox_cb = FALSE;
 
@@ -99,9 +97,7 @@ GHashTable *sensor_freq;
 
 static void reset_plot_state(void)
 {
-    session_t0 = 0;
-    global_t_min = UINT64_MAX;
-    global_t_max = 0;
+    server_t0 = 0;
 
     for (int s = 0; s < SENSOR_COUNT; s++)
     {
@@ -214,7 +210,7 @@ static void shutdown_clicked(GtkButton *b, gpointer d)
 static gboolean redraw_graph(gpointer data)
 {
     gtk_widget_queue_draw(graph_area);
-    return G_SOURCE_REMOVE;
+    return G_SOURCE_CONTINUE;
 }
 
 static void *net_rx_thread(void *arg)
@@ -275,32 +271,19 @@ static void update_dropdown()
 
 void push_sample(int sid, double value, uint64_t ts)
 {
-    /* Initialize session time origin */
-    if (session_t0 == 0)
-        session_t0 = ts;
+    if (server_t0 == 0)
+        server_t0 = ts;
 
-    /* Normalize timestamp to session time */
-    ts -= session_t0;
+    uint64_t rel_ts = ts - server_t0;
 
+    pthread_mutex_lock(&sample_lock);
     sample_data[sid][sample_head[sid]] = value;
-    sample_ts[sid][sample_head[sid]] = ts;
+    sample_ts[sid][sample_head[sid]] = rel_ts;
 
     sample_head[sid] = (sample_head[sid] + 1) % MAX_SAMPLES;
-
     if (sample_count[sid] < MAX_SAMPLES)
         sample_count[sid]++;
-
-    /* ---------- Incremental time window tracking ---------- */
-
-    if (ts < global_t_min)
-        global_t_min = ts;
-
-    if (ts > global_t_max)
-        global_t_max = ts;
-
-    /* Enforce sliding window */
-    if (global_t_max - global_t_min > TIME_WINDOW_US)
-        global_t_min = global_t_max - TIME_WINDOW_US;
+    pthread_mutex_unlock(&sample_lock);
 }
 
 static void combo_changed(GtkComboBox *box, gpointer d)
@@ -718,6 +701,7 @@ static void start_clicked(GtkButton *b, gpointer d)
     }
 
     net_running = 1;
+
     pthread_create(&net_thread, NULL, net_rx_thread, NULL);
 
     state = STATE_RUNNING;
@@ -786,6 +770,33 @@ adjust_bg_for_legend(GdkRGBA bg)
 
 static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
 {
+    uint64_t t_max = 0;
+
+    static uint64_t visible_ts[MAX_SAMPLES];
+    static double visible_val[SENSOR_COUNT][MAX_SAMPLES];
+    static int visible_count[SENSOR_COUNT];
+
+    pthread_mutex_lock(&sample_lock);
+
+    for (int s = 0; s < SENSOR_COUNT; s++)
+    {
+        if (sample_count[s] > 0)
+        {
+            int last = (sample_head[s] - 1 + MAX_SAMPLES) % MAX_SAMPLES;
+            uint64_t ts = sample_ts[s][last];
+            if (ts > t_max)
+                t_max = ts;
+        }
+    }
+
+    pthread_mutex_unlock(&sample_lock);
+
+    uint64_t t_min =
+        (t_max > TIME_WINDOW_US) ? (t_max - TIME_WINDOW_US) : 0;
+
+    for (int s = 0; s < SENSOR_COUNT; s++)
+        visible_count[s] = 0;
+
     GtkAllocation alloc;
     gtk_widget_get_allocation(widget, &alloc);
     int plot_w, plot_h;
@@ -804,38 +815,6 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     plot_w = width - left_margin - 10;
     plot_h = height - bottom_margin - 10;
 
-    /* ================== Time Window (global, incremental) ================== */
-    if (global_t_min == UINT64_MAX || global_t_max <= global_t_min)
-        return FALSE;
-
-    uint64_t t_max = global_t_max;
-    uint64_t t_min = global_t_min;
-
-    /* Clamp to sliding window */
-    if (t_max - t_min > TIME_WINDOW_US)
-        t_min = t_max - TIME_WINDOW_US;
-
-    /* Find earliest visible timestamp from actual samples */
-    // for (int s = 0; s < SENSOR_COUNT; s++)
-    // {
-    //     if (!is_sensor_selected(s))
-    //         continue;
-
-    //     int count = sample_count[s];
-    //     int head = sample_head[s];
-    //     int start = (head - count + MAX_SAMPLES) % MAX_SAMPLES;
-
-    //     for (int i = 0; i < count; i++)
-    //     {
-    //         int idx = (start + i) % MAX_SAMPLES;
-    //         uint64_t ts = sample_ts[s][idx];
-
-    //         if (ts >= t_max - TIME_WINDOW_US && ts < t_min)
-    //             t_min = ts;
-    //     }
-    // }
-
-    /* Safety: ensure non-zero span */
     if (t_max <= t_min)
         return FALSE;
 
@@ -924,6 +903,28 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
         if (sample_count[s] < 2)
             continue;
 
+        int head = sample_head[s];
+        int count = sample_count[s];
+        int start = (head - count + MAX_SAMPLES) % MAX_SAMPLES;
+
+        visible_count[s] = 0;
+
+        for (int i = 0; i < count; i++)
+        {
+            int idx = (start + i) % MAX_SAMPLES;
+            uint64_t ts = sample_ts[s][idx];
+
+            if (ts < t_min)
+                continue;
+
+            visible_ts[visible_count[s]] = ts;
+            visible_val[s][visible_count[s]] = sample_data[s][idx];
+            visible_count[s]++;
+        }
+
+        if (visible_count[s] < 2)
+            continue;
+
         cairo_set_source_rgb(cr,
                              plot_colors[s][0],
                              plot_colors[s][1],
@@ -931,29 +932,15 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
 
         cairo_set_line_width(cr, 2.0);
 
-        int head = sample_head[s];
-        int count = sample_count[s];
-
-        int start = (head - count + MAX_SAMPLES) % MAX_SAMPLES;
-
         gboolean started = FALSE;
+        int n = visible_count[s];
 
-        for (int i = 0; i < count; i++)
+        for (int i = 0; i < n; i++)
         {
-            int idx = (start + i) % MAX_SAMPLES;
-            double v = sample_data[s][idx];
-
-            uint64_t ts = sample_ts[s][idx];
-
-            if (ts < t_min)
-                continue; // outside window
-
-            double span = (double)(t_max - t_min);
-            if (span <= 0)
-                continue;
-
             double x = left_margin +
-                       plot_w * (double)(ts - t_min) / span;
+                       plot_w * (double)i / (double)(n - 1);
+
+            double v = visible_val[s][i];
 
             /* ADC-style scaling (0–4095) */
             double norm = v / sensor_y_max[s];
@@ -1120,12 +1107,25 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     int tick_count = plot_w / grid_spacing;
     if (tick_count < 1)
         tick_count = 1;
-    uint64_t tick_step_us = (t_max - t_min) / tick_count;
+
+    int ref_sensor = -1;
+    for (int s = 0; s < SENSOR_COUNT; s++)
+    {
+        if (is_sensor_selected(s) && visible_count[s] > 1)
+        {
+            ref_sensor = s;
+            break;
+        }
+    }
+
+    if (ref_sensor < 0)
+        return FALSE;
 
     for (int i = 0; i <= tick_count; i++)
     {
         double x = left_margin + i * grid_spacing;
-        uint64_t t = t_min + i * tick_step_us;
+        int idx = (visible_count[ref_sensor] - 1) * i / tick_count;
+        uint64_t t = visible_ts[idx];
 
         /* Tick mark */
         cairo_move_to(cr, x + 0.5, height - bottom_margin);
@@ -1387,6 +1387,7 @@ int main(int argc, char **argv)
 
     apply_state();
     gtk_widget_show_all(win);
+    g_timeout_add(33, redraw_graph, NULL);
     gtk_main();
     return 0;
 }
