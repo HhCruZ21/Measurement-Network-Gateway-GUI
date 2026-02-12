@@ -104,6 +104,11 @@ typedef enum
     CMD_HELP
 } CmdType;
 
+typedef struct {
+    sensor_rate_t rates[SENSOR_COUNT];
+} RatesMsg;
+
+
 typedef struct
 {
     CmdType type;

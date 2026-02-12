@@ -246,42 +246,123 @@ static gboolean redraw_graph(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
-static void *net_rx_thread(void *arg)
+static gboolean handle_rates_update(gpointer data)
 {
-    sensor_data_t pkt;
+    RatesMsg *msg = (RatesMsg *)data;
+    server_t0 = 0;
 
-    while (net_running)
+    for (int i = 0; i < SENSOR_COUNT; i++)
     {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(sock_fd, &rfds);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%u", msg->rates[i].rate_hz);
 
-        struct timeval tv = {
-            .tv_sec = 0,
-            .tv_usec = 200000 // 200 ms
-        };
+        g_hash_table_replace(sensor_freq,
+                             g_strdup(sensor_ids[msg->rates[i].sensor_id]),
+                             g_strdup(buf));
 
-        int ret = select(sock_fd + 1, &rfds, NULL, NULL, &tv);
-        if (ret <= 0)
-            continue; // timeout or signal
-
-        ssize_t n = recv(sock_fd, &pkt, sizeof(pkt), 0);
-        if (n <= 0)
+        /* Dynamic time window for ADC0 */
+        if (msg->rates[i].sensor_id == adc_zero_sid &&
+            msg->rates[i].rate_hz > 0)
         {
-            printf("[NET] Server disconnected (recv=%zd)\n", n);
+            double sample_period_us =
+                1e6 / msg->rates[i].rate_hz;
 
-            /* Notify GTK main thread */
-            g_idle_add(handle_connection_lost, NULL);
-            break;
-        }
+            time_window_us =
+                (uint64_t)(VISIBLE_SAMPLES * sample_period_us);
 
-        if (pkt.sensor_id < SENSOR_COUNT)
-        {
-            push_sample(pkt.sensor_id, pkt.sensor_value, pkt.timestamp);
-            g_idle_add(redraw_graph, NULL);
+            if (time_window_us < MIN_WINDOW_US)
+                time_window_us = MIN_WINDOW_US;
+            if (time_window_us > MAX_WINDOW_US)
+                time_window_us = MAX_WINDOW_US;
+
+            printf("[GUI] Time window set to %.2f ms\n",
+                   time_window_us / 1000.0);
         }
     }
 
+    /* Update Hz entry for active sensor */
+    const char *active =
+        gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
+
+    if (active)
+    {
+        const char *val =
+            g_hash_table_lookup(sensor_freq, active);
+        gtk_entry_set_text(GTK_ENTRY(hz_entry),
+                           val ? val : "");
+    }
+
+    if (!msg)
+        return G_SOURCE_REMOVE;
+
+    g_free(msg);
+    return G_SOURCE_REMOVE;
+}
+
+static void *net_rx_thread(void *arg)
+{
+    const size_t batch_size = 1440;
+    sensor_data_t batch[batch_size / sizeof(sensor_data_t)];
+
+    char hdr[6];
+
+    while (net_running)
+    {
+        // Peek first 6 bytes
+        ssize_t n = recv(sock_fd, hdr, 6, MSG_PEEK);
+        if (n <= 0)
+            break;
+
+        if (n == 6 && memcmp(hdr, "RATES\n", 6) == 0)
+        {
+            // Consume header
+            recv_all(sock_fd, hdr, 6);
+
+            sensor_rate_t rates[SENSOR_COUNT];
+            if (recv_all(sock_fd, rates, sizeof(rates)) < 0)
+                break;
+
+            RatesMsg *msg = g_malloc(sizeof(RatesMsg));
+            memcpy(msg->rates, rates, sizeof(msg->rates));
+            g_idle_add(handle_rates_update, msg);
+
+            continue;
+        }
+
+        // Otherwise assume streaming batch
+        uint32_t net_size;
+        if (recv_all(sock_fd, &net_size, sizeof(net_size)) < 0)
+            break;
+
+        uint32_t payload_size = ntohl(net_size);
+
+        if (payload_size == 0 || payload_size > sizeof(batch))
+        {
+            printf("Invalid payload size: %u\n", payload_size);
+            break;
+        }
+
+        if (recv_all(sock_fd, batch, payload_size) < 0)
+            break;
+
+        int samples = payload_size / sizeof(sensor_data_t);
+
+        for (int i = 0; i < samples; i++)
+        {
+            sensor_data_t *pkt = &batch[i];
+
+            if (pkt->sensor_id < SENSOR_COUNT)
+            {
+                push_sample(pkt->sensor_id,
+                            pkt->sensor_value,
+                            pkt->timestamp);
+            }
+        }
+
+        g_idle_add(redraw_graph, NULL);
+    }
+
+    g_idle_add(handle_connection_lost, NULL);
     return NULL;
 }
 
@@ -310,18 +391,40 @@ static void update_dropdown()
 
 void push_sample(int sid, double value, uint64_t ts)
 {
+    static uint64_t last_ts = 0;
+
+    /* Detect timestamp reset or backward jump */
+    if (last_ts != 0 && ts < last_ts)
+    {
+        printf("[GUI] Timestamp reset detected → clearing buffers\n");
+
+        pthread_mutex_lock(&sample_lock);
+        for (int s = 0; s < SENSOR_COUNT; s++)
+        {
+            sample_count[s] = 0;
+            sample_head[s] = 0;
+        }
+        pthread_mutex_unlock(&sample_lock);
+
+        server_t0 = ts;
+    }
+
     if (server_t0 == 0)
         server_t0 = ts;
 
     uint64_t rel_ts = ts - server_t0;
+    last_ts = ts;
 
     pthread_mutex_lock(&sample_lock);
+
     sample_data[sid][sample_head[sid]] = value;
     sample_ts[sid][sample_head[sid]] = rel_ts;
 
     sample_head[sid] = (sample_head[sid] + 1) % MAX_SAMPLES;
+
     if (sample_count[sid] < MAX_SAMPLES)
         sample_count[sid]++;
+
     pthread_mutex_unlock(&sample_lock);
 }
 
@@ -784,6 +887,9 @@ static void connect_clicked(GtkButton *b, gpointer d)
     printf("Connected to server %s\n", ip);
     set_connect_status("Connection successful", "green");
 
+    net_running = 1;
+    pthread_create(&net_thread, NULL, net_rx_thread, NULL);
+
     reset_plot_state();
 
     strncpy(connected_ip, ip, sizeof(connected_ip) - 1);
@@ -841,7 +947,7 @@ static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer us
     if (net_running)
     {
         net_running = 0;
-        shutdown(sock_fd, SHUT_RDWR);   // unblock recv
+        // shutdown(sock_fd, SHUT_RDWR);   // unblock recv
         pthread_join(net_thread, NULL); // wait for thread to exit
     }
 
@@ -886,80 +992,20 @@ static void start_clicked(GtkButton *b, gpointer d)
     if (sock_fd < 0)
         return;
 
-    send(sock_fd, "START\n", 6, 0);
+    if (state == STATE_RUNNING)
+        return;
+
+    ssize_t n = send(sock_fd, "START\n", 6, 0);
+    if (n <= 0)
+    {
+        printf("Failed to send START\n");
+        return;
+    }
+
     printf("Sent START\n");
 
-    char hdr[6]; // +1 for null terminator
-
-    if (recv_all(sock_fd, hdr, 6) < 0 ||
-        memcmp(hdr, "RATES\n", 6) != 0)
-    {
-        printf("ERROR: invalid RATES header\n");
-        return;
-    }
-
-    sensor_rate_t rates[SENSOR_COUNT];
-
-    if (recv_all(sock_fd, rates, sizeof(rates)) < 0)
-    {
-        printf("ERROR: failed to receive sensor rates\n");
-        return;
-    }
-
-    /* Store rates in model */
-    for (int i = 0; i < SENSOR_COUNT; i++)
-    {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%u", rates[i].rate_hz);
-
-        g_hash_table_replace(sensor_freq,
-                             g_strdup(sensor_ids[rates[i].sensor_id]),
-                             g_strdup(buf));
-
-        printf("[GUI] Sensor %s -> %s Hz\n",
-               sensor_ids[rates[i].sensor_id], buf);
-
-        /* === Dynamic time window based on ADC frequency === */
-        if (rates[i].sensor_id == adc_zero_sid &&
-            rates[i].rate_hz > 0)
-        {
-            if (rates[i].sensor_id == adc_zero_sid &&
-                rates[i].rate_hz > 0)
-            {
-                double sample_period_us = 1e6 / rates[i].rate_hz;
-
-                time_window_us =
-                    (uint64_t)(VISIBLE_SAMPLES * sample_period_us);
-
-                if (time_window_us < MIN_WINDOW_US)
-                    time_window_us = MIN_WINDOW_US;
-                if (time_window_us > MAX_WINDOW_US)
-                    time_window_us = MAX_WINDOW_US;
-
-                printf("[GUI] Time window set to %.2f ms\n",
-                       time_window_us / 1000.0);
-            }
-
-            printf("[GUI] Time window set to %.2f ms\n",
-                   time_window_us / 1000.0);
-        }
-    }
-
-    /* Update Hz entry for active sensor */
-    const char *active =
-        gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
-
-    if (active)
-    {
-        const char *val = g_hash_table_lookup(sensor_freq, active);
-        gtk_entry_set_text(GTK_ENTRY(hz_entry), val ? val : "");
-    }
-
-    net_running = 1;
-
-    pthread_create(&net_thread, NULL, net_rx_thread, NULL);
-
     state = STATE_RUNNING;
+
     update_dropdown();
     apply_state();
 }
@@ -986,9 +1032,6 @@ static void stop_clicked(GtkButton *b, gpointer d)
 
     send(sock_fd, "STOP\n", 5, 0);
     printf("Sent STOP\n");
-
-    net_running = 0;
-    pthread_join(net_thread, NULL);
 
     state = STATE_CONNECTED;
     apply_state();
@@ -1071,7 +1114,7 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     plot_h = height - bottom_margin - 10;
 
     if (t_max <= t_min)
-        return FALSE;
+        t_max = t_min + 1;
 
     /* ================== Faint Grid ================== */
     cairo_set_source_rgba(cr, 0.7, 0.7, 0.7, 0.1);
@@ -1203,21 +1246,6 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
                 break;
 
             double v = visible_val[s][i];
-
-            static double last_v = 0;
-            static uint64_t last_peak_ts = 0;
-
-            if (last_v < 2048 && v >= 2048) // rising zero-cross (rough)
-            {
-                if (last_peak_ts != 0)
-                {
-                    printf("Δt = %.2f ms\n",
-                           (visible_ts[i] - last_peak_ts) / 1000.0);
-                }
-                last_peak_ts = visible_ts[i];
-            }
-
-            last_v = v;
 
             /* ADC-style scaling (0–4095) */
             double norm = v / sensor_y_max[s];
@@ -1396,7 +1424,7 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     }
 
     if (ref_sensor < 0)
-        return FALSE;
+        ref_sensor = 0;
 
     for (int i = 0; i <= tick_count; i++)
     {
