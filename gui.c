@@ -221,6 +221,9 @@ static void shutdown_clicked(GtkButton *b, gpointer d)
         printf("Sent STOP (before shutdown)\n");
     }
 
+    send(sock_fd, "SHUTDOWN\n", 9, 0);
+    printf("Sent SHUTDOWN\n");
+
     if (net_running)
     {
         net_running = 0;
@@ -230,9 +233,6 @@ static void shutdown_clicked(GtkButton *b, gpointer d)
 
     if (sock_fd >= 0)
     {
-        send(sock_fd, "SHUTDOWN\n", 9, 0);
-        printf("Sent SHUTDOWN\n");
-
         close(sock_fd);
         sock_fd = -1;
     }
@@ -1115,8 +1115,8 @@ static void connect_clicked()
 }
 
 static gboolean on_window_delete(GtkWidget *widget,
-                                  GdkEvent *event,
-                                  gpointer user_data)
+                                 GdkEvent *event,
+                                 gpointer user_data)
 {
 
     (void)event;
