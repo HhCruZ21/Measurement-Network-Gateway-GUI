@@ -23,6 +23,7 @@ void push_sample(int sid, double value, uint64_t ts);
 static void *net_rx_thread(void *arg);
 static int recv_all(int fd, void *buf, size_t len);
 static void set_connect_status(const char *msg, const char *color);
+static void connect_clicked(GtkButton *b, gpointer d);
 
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -152,7 +153,7 @@ static void apply_state()
     set_enabled(hz_entry, running);
     set_enabled(config_btn,
                 running && strlen(gtk_entry_get_text(GTK_ENTRY(hz_entry))) > 0);
-    set_enabled(cmd_entry, running);
+    set_enabled(cmd_entry, TRUE);
 }
 
 static gboolean handle_connection_lost(gpointer data)
@@ -604,6 +605,7 @@ static void open_help_terminal(void)
 static void cmd_enter(GtkEntry *e, gpointer d)
 {
     char buf[128];
+
     strncpy(buf, gtk_entry_get_text(e), sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = 0;
 
@@ -659,78 +661,106 @@ static void cmd_enter(GtkEntry *e, gpointer d)
     CmdError err = CMD_ERR_SYNTAX;
     const char *id = NULL;
 
-    if (!tok1 || !tok2 || !tok3 || extra ||
-        g_ascii_strcasecmp(tok1, "CONFIGURE") != 0)
+    if (!tok1)
     {
         err = CMD_ERR_SYNTAX;
         goto done;
     }
 
-    id = canonical_sensor(tok2);
-    if (!id)
+    /* ================= CONNECT ================= */
+    if (g_ascii_strcasecmp(tok1, "CONNECT") == 0)
     {
-        err = CMD_ERR_SENSOR;
+        if (!tok2 || tok3 || extra)
+        {
+            err = CMD_ERR_SYNTAX;
+            goto done;
+        }
+
+        /* Validate IP */
+        if (!is_valid_ipv4(tok2))
+        {
+            err = CMD_ERR_SYNTAX;
+            goto done;
+        }
+
+        /* Prevent reconnect if already connected */
+        if (state != STATE_DISCONNECTED)
+        {
+            err = CMD_ERR_SYNTAX;
+            goto done;
+        }
+
+        /* Set IP into textbox */
+        gtk_entry_set_text(GTK_ENTRY(connect_entry), tok2);
+
+        /* Trigger same workflow as button click */
+        connect_clicked(NULL, NULL);
+
+        valid = TRUE;
+        err = CMD_OK;
+
         goto done;
     }
 
-    /* numeric check */
-    for (int i = 0; tok3[i]; i++)
+    /* ================= CONFIGURE ================= */
+    if (g_ascii_strcasecmp(tok1, "CONFIGURE") == 0)
     {
-        if (!isdigit((unsigned char)tok3[i]))
+        if (!tok2 || !tok3 || extra)
+        {
+            err = CMD_ERR_SYNTAX;
+            goto done;
+        }
+
+        id = canonical_sensor(tok2);
+        if (!id)
+        {
+            err = CMD_ERR_SENSOR;
+            goto done;
+        }
+
+        for (int i = 0; tok3[i]; i++)
+        {
+            if (!isdigit((unsigned char)tok3[i]))
+            {
+                err = CMD_ERR_FREQ_RANGE;
+                goto done;
+            }
+        }
+
+        int rate = atoi(tok3);
+        if (rate < 10 || rate > 1000)
         {
             err = CMD_ERR_FREQ_RANGE;
             goto done;
         }
-    }
 
-    int rate = atoi(tok3);
-    if (rate < 10 || rate > 1000)
-    {
-        err = CMD_ERR_FREQ_RANGE;
+        valid = TRUE;
+        err = CMD_OK;
+
+        g_hash_table_replace(sensor_freq,
+                             g_strdup(id),
+                             g_strdup(tok3));
+
+        const char *active =
+            gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
+        if (active && strcmp(active, id) == 0)
+            gtk_entry_set_text(GTK_ENTRY(hz_entry), tok3);
+
+        if (sock_fd >= 0)
+        {
+            char net_cmd[64];
+            snprintf(net_cmd, sizeof(net_cmd),
+                     "CONFIGURE %s %d\n", id, rate);
+            send(sock_fd, net_cmd, strlen(net_cmd), 0);
+            printf("Sent: %s", net_cmd);
+        }
+
         goto done;
     }
 
-    /* ---- SUCCESS ---- */
-    valid = TRUE;
-    err = CMD_OK;
-
-    // if (!tok1 || !tok2 || !tok3 || extra ||
-    // g_ascii_strcasecmp(tok1, "CONFIGURE") != 0)
-    // {
-    //     /* validate numeric rate */
-    //     for (int i = 0; tok3[i]; i++)
-    //     {
-    //         if (!isdigit((unsigned char)tok3[i]))
-    //             goto done;
-    //     }
-
-    //     int rate = atoi(tok3);
-    //     if (rate >= 10 && rate <= 1000)
-    //     {
-    //         valid = TRUE;
-
-    /* update local model */
-    g_hash_table_replace(sensor_freq,
-                         g_strdup(id),
-                         g_strdup(tok3));
-
-    /* update Hz entry if same sensor selected */
-    const char *active =
-        gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
-    if (active && strcmp(active, id) == 0)
-        gtk_entry_set_text(GTK_ENTRY(hz_entry), tok3);
-
-    /* send to server */
-    if (sock_fd >= 0)
-    {
-        char net_cmd[64];
-        snprintf(net_cmd, sizeof(net_cmd),
-                 "CONFIGURE %s %d\n", id, rate);
-        send(sock_fd, net_cmd, strlen(net_cmd), 0);
-        printf("Sent: %s", net_cmd);
-    }
-    //     }
-    // }
+    /* Unknown command */
+    err = CMD_ERR_SYNTAX;
+    goto done;
 
 done:;
     GtkStyleContext *ec = gtk_widget_get_style_context(GTK_WIDGET(e));
