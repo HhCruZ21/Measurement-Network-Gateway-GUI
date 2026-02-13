@@ -20,14 +20,15 @@
 #define MAX_WINDOW_US 5000000ULL // 5 s
 
 void push_sample(int sid, double value, uint64_t ts);
-static void *net_rx_thread(void *arg);
+static void *net_rx_thread();
 static int recv_all(int fd, void *buf, size_t len);
 static void set_connect_status(const char *msg, const char *color);
-static void connect_clicked(GtkButton *b, gpointer d);
+static void connect_clicked();
 static void disconnect_clicked(GtkButton *b, gpointer d);
-static void start_clicked(GtkButton *b, gpointer d);
-static void stop_clicked(GtkButton *b, gpointer d);
+static void start_clicked();
+static void stop_clicked();
 
+GtkWidget *main_window = NULL;
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t sample_ts[SENSOR_COUNT][MAX_SAMPLES];
@@ -195,9 +196,11 @@ static int checked_count()
 
 static void shutdown_clicked(GtkButton *b, gpointer d)
 {
+    (void)b;
+    (void)d;
 
     GtkWidget *dialog = gtk_message_dialog_new(
-        GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(b))),
+        GTK_WINDOW(main_window),
         GTK_DIALOG_MODAL,
         GTK_MESSAGE_WARNING,
         GTK_BUTTONS_YES_NO,
@@ -209,12 +212,7 @@ static void shutdown_clicked(GtkButton *b, gpointer d)
     gtk_widget_destroy(dialog);
 
     if (response != GTK_RESPONSE_YES)
-    {
-        /* User chose NO → do nothing */
         return;
-    }
-
-    /* -------- User confirmed shutdown -------- */
 
     /* Stop streaming if running */
     if (state == STATE_RUNNING && sock_fd >= 0)
@@ -244,7 +242,7 @@ static void shutdown_clicked(GtkButton *b, gpointer d)
     gtk_main_quit();
 }
 
-static gboolean redraw_graph(gpointer data)
+static gboolean redraw_graph()
 {
     gtk_widget_queue_draw(graph_area);
     return G_SOURCE_CONTINUE;
@@ -303,7 +301,7 @@ static gboolean handle_rates_update(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
-static void *net_rx_thread(void *arg)
+static void *net_rx_thread()
 {
     const size_t batch_size = 1440;
     sensor_data_t batch[batch_size / sizeof(sensor_data_t)];
@@ -372,7 +370,7 @@ static void *net_rx_thread(void *arg)
 
 /* ---------- Focus handling ---------- */
 
-static gboolean entry_focus_out(GtkWidget *w, GdkEvent *e, gpointer d)
+static gboolean entry_focus_out(GtkWidget *w)
 {
     gtk_editable_select_region(GTK_EDITABLE(w), -1, -1);
     gtk_editable_set_position(GTK_EDITABLE(w), -1);
@@ -432,7 +430,7 @@ void push_sample(int sid, double value, uint64_t ts)
     pthread_mutex_unlock(&sample_lock);
 }
 
-static void combo_changed(GtkComboBox *box, gpointer d)
+static void combo_changed(GtkComboBox *box)
 {
     const char *id = gtk_combo_box_get_active_id(box);
     if (!id)
@@ -448,7 +446,7 @@ static gboolean is_sensor_selected(int idx)
         GTK_TOGGLE_BUTTON(checkboxes[idx]));
 }
 
-static gboolean cmd_key_press(GtkWidget *w, GdkEventKey *e, gpointer d)
+static gboolean cmd_key_press(GtkWidget *w, GdkEventKey *e)
 {
     if (cmd_hist_count == 0)
         return FALSE;
@@ -482,7 +480,7 @@ static gboolean cmd_key_press(GtkWidget *w, GdkEventKey *e, gpointer d)
 
 /* ---------- Checkbox logic ---------- */
 
-static void checkbox_changed(GtkToggleButton *btn, gpointer d)
+static void checkbox_changed(GtkToggleButton *btn)
 {
     if (suppress_checkbox_cb)
         return;
@@ -504,7 +502,7 @@ static void checkbox_changed(GtkToggleButton *btn, gpointer d)
 
 /* ---------- Hz ---------- */
 
-static void hz_changed(GtkEditable *e, gpointer d)
+static void hz_changed()
 {
     const char *txt = gtk_entry_get_text(GTK_ENTRY(hz_entry));
 
@@ -543,7 +541,7 @@ static void hz_changed(GtkEditable *e, gpointer d)
     set_enabled(config_btn, valid);
 }
 
-static void configure_clicked(GtkButton *b, gpointer d)
+static void configure_clicked()
 {
     if (sock_fd < 0)
         return;
@@ -605,7 +603,7 @@ static void open_help_terminal(void)
                   NULL, NULL, NULL, NULL);
 }
 
-static void cmd_enter(GtkEntry *e, gpointer d)
+static void cmd_enter(GtkEntry *e)
 {
     char buf[128];
 
@@ -697,7 +695,7 @@ static void cmd_enter(GtkEntry *e, gpointer d)
         gtk_entry_set_text(GTK_ENTRY(connect_entry), tok2);
 
         /* Trigger same workflow as button click */
-        connect_clicked(NULL, NULL);
+        connect_clicked();
 
         valid = TRUE;
         err = CMD_OK;
@@ -735,6 +733,36 @@ static void cmd_enter(GtkEntry *e, gpointer d)
         goto done;
     }
 
+    /* ================= SHUTDOWN ================= */
+    if (g_ascii_strcasecmp(tok1, "SHUTDOWN") == 0)
+    {
+        if (tok2 || tok3 || extra)
+        {
+            err = CMD_ERR_SYNTAX;
+            goto done;
+        }
+
+        if (state == STATE_DISCONNECTED)
+        {
+            err = CMD_ERR_NOT_CONNECTED;
+            goto done;
+        }
+
+        if (state == STATE_RUNNING)
+        {
+            err = CMD_ERR_RUNNING;
+            goto done;
+        }
+
+        /* Trigger same workflow as button click */
+        shutdown_clicked(NULL, NULL);
+
+        valid = TRUE;
+        err = CMD_OK;
+
+        goto done;
+    }
+
     /* ================= START ================= */
     if (g_ascii_strcasecmp(tok1, "START") == 0)
     {
@@ -757,7 +785,7 @@ static void cmd_enter(GtkEntry *e, gpointer d)
         }
 
         /* Trigger same workflow as button click */
-        start_clicked(NULL, NULL);
+        start_clicked();
 
         valid = TRUE;
         err = CMD_OK;
@@ -787,7 +815,7 @@ static void cmd_enter(GtkEntry *e, gpointer d)
         }
 
         /* Trigger same workflow as button click */
-        stop_clicked(NULL, NULL);
+        stop_clicked();
 
         valid = TRUE;
         err = CMD_OK;
@@ -986,7 +1014,7 @@ static void set_connect_status(const char *msg, const char *color)
     }
 }
 
-static void connect_clicked(GtkButton *b, gpointer d)
+static void connect_clicked()
 {
     const char *ip = gtk_entry_get_text(GTK_ENTRY(connect_entry));
     if (!ip || !*ip)
@@ -1086,8 +1114,13 @@ static void connect_clicked(GtkButton *b, gpointer d)
     apply_state();
 }
 
-static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer user_data)
+static gboolean on_window_delete(GtkWidget *widget,
+                                  GdkEvent *event,
+                                  gpointer user_data)
 {
+
+    (void)event;
+    (void)user_data;
     /* If not connected, allow close immediately */
     if (state == STATE_DISCONNECTED)
     {
@@ -1132,7 +1165,7 @@ static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer us
     if (net_running)
     {
         net_running = 0;
-        // shutdown(sock_fd, SHUT_RDWR);   // unblock recv
+        shutdown(sock_fd, SHUT_RDWR);   // unblock recv
         pthread_join(net_thread, NULL); // wait for thread to exit
     }
 
@@ -1152,6 +1185,8 @@ static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer us
 
 static void disconnect_clicked(GtkButton *b, gpointer d)
 {
+    (void)b;
+    (void)d;
     if (net_running)
     {
         net_running = 0;
@@ -1172,7 +1207,7 @@ static void disconnect_clicked(GtkButton *b, gpointer d)
     apply_state();
 }
 
-static void start_clicked(GtkButton *b, gpointer d)
+static void start_clicked()
 {
     if (sock_fd < 0)
         return;
@@ -1210,7 +1245,7 @@ static int recv_all(int fd, void *buf, size_t len)
     return 0;
 }
 
-static void stop_clicked(GtkButton *b, gpointer d)
+static void stop_clicked()
 {
     if (sock_fd < 0)
         return;
@@ -1251,7 +1286,7 @@ adjust_bg_for_legend(GdkRGBA bg)
     return out;
 }
 
-static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
+static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
 {
     uint64_t t_max = 0;
 
@@ -1283,7 +1318,6 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr, gpointer data)
     GtkAllocation alloc;
     gtk_widget_get_allocation(widget, &alloc);
     int plot_w, plot_h;
-    const int legend_margin = 120;
 
     int width = alloc.width;
     int height = alloc.height;
@@ -1699,17 +1733,17 @@ int main(int argc, char **argv)
     sensor_freq =
         g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 
-    GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(win), "Measurement Network Gateway - GUI");
-    gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER);
-    gtk_window_set_default_size(GTK_WINDOW(win), 1200, 800);
+    main_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(main_window), "Measurement Network Gateway - GUI");
+    gtk_window_set_position(GTK_WINDOW(main_window), GTK_WIN_POS_CENTER);
+    gtk_window_set_default_size(GTK_WINDOW(main_window), 1200, 800);
 
-    g_signal_connect(win, "delete-event",
+    g_signal_connect(main_window, "delete-event",
                      G_CALLBACK(on_window_delete), NULL);
 
     GtkWidget *main_v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_container_set_border_width(GTK_CONTAINER(main_v), 16);
-    gtk_container_add(GTK_CONTAINER(win), main_v);
+    gtk_container_add(GTK_CONTAINER(main_window), main_v);
 
     /* Section A */
     GtkWidget *secA = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -1803,7 +1837,7 @@ int main(int argc, char **argv)
                      G_CALLBACK(draw_grid), NULL);
 
     /* Redraw plot when GTK theme / style changes */
-    g_signal_connect(win, "style-updated",
+    g_signal_connect(main_window, "style-updated",
                      G_CALLBACK(gtk_widget_queue_draw),
                      graph_area);
 
@@ -1890,7 +1924,7 @@ int main(int argc, char **argv)
     g_signal_connect(connect_entry, "changed", G_CALLBACK(apply_state), NULL);
 
     apply_state();
-    gtk_widget_show_all(win);
+    gtk_widget_show_all(main_window);
     g_timeout_add(33, redraw_graph, NULL);
     gtk_main();
     return 0;
