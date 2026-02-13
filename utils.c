@@ -83,6 +83,14 @@ const char *HELP_TEXT =
 
 uint64_t time_window_us = 5000000ULL; // default: 5s fallback
 
+/**
+ * @brief Validates IPv4 address string.
+ *
+ * Ensures strict a.b.c.d format with values 0–255.
+ *
+ * @param ip IP address string
+ * @return gboolean TRUE if valid
+ */
 gboolean is_valid_ipv4(const char *ip)
 {
     if (!ip || !*ip)
@@ -107,11 +115,28 @@ gboolean is_valid_ipv4(const char *ip)
     return TRUE;
 }
 
+/**
+ * @brief Enables or disables a GTK widget.
+ *
+ * @param w Widget pointer
+ * @param e TRUE to enable, FALSE to disable
+ * @return void
+ */
 void set_enabled(GtkWidget *w, gboolean e)
 {
     gtk_widget_set_sensitive(w, e);
 }
 
+/**
+ * @brief Loads custom CSS styles for GUI.
+ *
+ * Defines styles for:
+ * - Command success/error borders
+ * - Text coloring
+ * - Clean focus styling
+ *
+ * @return void
+ */
 void load_css(void)
 {
     GtkCssProvider *provider = gtk_css_provider_new();
@@ -144,6 +169,15 @@ void load_css(void)
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 }
 
+/**
+ * @brief Clears command feedback styling and resets entry state.
+ *
+ * Removes success/error classes, clears label text,
+ * restores default icon, and re-enables entry.
+ *
+ * @param data Pointer to CmdClearCtx
+ * @return gboolean FALSE
+ */
 gboolean clear_cmd_feedback(gpointer data)
 {
     CmdClearCtx *ctx = data;

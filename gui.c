@@ -1,3 +1,30 @@
+/******************************************************************************
+ * File: gui.c
+ * Author: Haizon Helet Cruz
+ * Date: 2026-02-13
+ *
+ * Description:
+ * Main GUI implementation for the Measurement Network Gateway application.
+ *
+ * This file contains:
+ *  - GTK-based graphical user interface construction
+ *  - TCP client networking logic for communication with backend server
+ *  - Multithreaded receive loop for sensor streaming
+ *  - Command-line interface parsing and validation
+ *  - Real-time plotting using Cairo
+ *  - State machine handling (DISCONNECTED / CONNECTED / RUNNING)
+ *  - Sensor configuration management and dynamic time-window scaling
+ *  - Command history and user feedback system
+ *
+ * The GUI supports:
+ *  - Connecting to a remote measurement device via IPv4
+ *  - Starting/stopping streaming
+ *  - Configuring per-sensor sampling frequency (10–1000 Hz)
+ *  - Live multi-sensor plotting with dynamic legend and scaling
+ *  - Safe disconnect, shutdown, and exit handling
+ *
+ ******************************************************************************/
+
 #include <string.h>
 #include <ctype.h>
 
@@ -107,8 +134,14 @@ GtkWidget *cmd_entry, *cmd_status;
 
 GHashTable *sensor_freq;
 
-/* ---------- CSS ---------- */
-
+/**
+ * @brief Resets all plotting buffers and timestamp reference.
+ *
+ * Clears sample counts, head indices, and resets the
+ * server timestamp origin used for relative plotting.
+ *
+ * @return void
+ */
 static void reset_plot_state(void)
 {
     server_t0 = 0;
@@ -120,7 +153,16 @@ static void reset_plot_state(void)
     }
 }
 
-/* ---------- Utilities ---------- */
+/**
+ * @brief Applies UI state based on current application state.
+ *
+ * Enables/disables buttons, entries, and controls depending on:
+ * - Connection state
+ * - Running state
+ * - IP validity
+ *
+ * @return void
+ */
 static void apply_state()
 {
     gboolean connected = (state != STATE_DISCONNECTED);
@@ -160,6 +202,15 @@ static void apply_state()
     set_enabled(cmd_entry, TRUE);
 }
 
+/**
+ * @brief Handles unexpected connection loss from network thread.
+ *
+ * Stops network thread, closes socket, resets buffers,
+ * updates UI state to DISCONNECTED.
+ *
+ * @param data Unused GTK callback data
+ * @return gboolean G_SOURCE_REMOVE (run once)
+ */
 static gboolean handle_connection_lost(gpointer data)
 {
     (void)data;
@@ -185,6 +236,11 @@ static gboolean handle_connection_lost(gpointer data)
     return G_SOURCE_REMOVE; // run once
 }
 
+/**
+ * @brief Counts how many sensor checkboxes are active.
+ *
+ * @return int Number of selected sensors
+ */
 static int checked_count()
 {
     int c = 0;
@@ -194,6 +250,17 @@ static int checked_count()
     return c;
 }
 
+/**
+ * @brief Handles Shutdown button click.
+ *
+ * Prompts user for confirmation, sends STOP (if running),
+ * sends SHUTDOWN command to server, cleans up network,
+ * and exits the application.
+ *
+ * @param b Button widget (unused)
+ * @param d User data (unused)
+ * @return void
+ */
 static void shutdown_clicked(GtkButton *b, gpointer d)
 {
     (void)b;
@@ -242,12 +309,28 @@ static void shutdown_clicked(GtkButton *b, gpointer d)
     gtk_main_quit();
 }
 
+/**
+ * @brief Triggers graph redraw.
+ *
+ * Queues a GTK draw event for the plotting area.
+ *
+ * @return gboolean G_SOURCE_CONTINUE
+ */
 static gboolean redraw_graph()
 {
     gtk_widget_queue_draw(graph_area);
     return G_SOURCE_CONTINUE;
 }
 
+/**
+ * @brief Updates sensor frequency configuration received from server.
+ *
+ * Adjusts internal frequency table and dynamically recalculates
+ * time window for ADC0 based on sampling rate.
+ *
+ * @param data Pointer to RatesMsg structure
+ * @return gboolean G_SOURCE_REMOVE
+ */
 static gboolean handle_rates_update(gpointer data)
 {
     RatesMsg *msg = (RatesMsg *)data;
@@ -301,6 +384,17 @@ static gboolean handle_rates_update(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+/**
+ * @brief Network receive thread.
+ *
+ * Continuously receives:
+ * - RATES messages
+ * - Streaming sensor batches
+ *
+ * Dispatches GUI updates via g_idle_add().
+ *
+ * @return void* NULL on exit
+ */
 static void *net_rx_thread()
 {
     const size_t batch_size = 1440;
@@ -368,8 +462,12 @@ static void *net_rx_thread()
     return NULL;
 }
 
-/* ---------- Focus handling ---------- */
-
+/**
+ * @brief Clears text selection and moves cursor to end when focus leaves entry.
+ *
+ * @param w GTK widget
+ * @return gboolean FALSE (propagate event)
+ */
 static gboolean entry_focus_out(GtkWidget *w)
 {
     gtk_editable_select_region(GTK_EDITABLE(w), -1, -1);
@@ -377,8 +475,13 @@ static gboolean entry_focus_out(GtkWidget *w)
     return FALSE;
 }
 
-/* ---------- Dropdown ---------- */
-
+/**
+ * @brief Updates sensor dropdown based on selected checkboxes.
+ *
+ * Rebuilds combo box entries dynamically.
+ *
+ * @return void
+ */
 static void update_dropdown()
 {
     gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(combo));
@@ -391,6 +494,17 @@ static void update_dropdown()
     gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
 }
 
+/**
+ * @brief Inserts a new sensor sample into circular buffer.
+ *
+ * Handles timestamp reset detection and maintains
+ * relative timestamp origin.
+ *
+ * @param sid Sensor ID
+ * @param value Sensor value
+ * @param ts Absolute timestamp (microseconds)
+ * @return void
+ */
 void push_sample(int sid, double value, uint64_t ts)
 {
     static uint64_t last_ts = 0;
@@ -430,6 +544,14 @@ void push_sample(int sid, double value, uint64_t ts)
     pthread_mutex_unlock(&sample_lock);
 }
 
+/**
+ * @brief Handles sensor dropdown change.
+ *
+ * Updates frequency entry field with stored sensor rate.
+ *
+ * @param box GTK combo box
+ * @return void
+ */
 static void combo_changed(GtkComboBox *box)
 {
     const char *id = gtk_combo_box_get_active_id(box);
@@ -440,12 +562,25 @@ static void combo_changed(GtkComboBox *box)
     gtk_entry_set_text(GTK_ENTRY(hz_entry), val ? val : "");
 }
 
+/**
+ * @brief Checks if a sensor checkbox is active.
+ *
+ * @param idx Sensor index
+ * @return gboolean TRUE if selected
+ */
 static gboolean is_sensor_selected(int idx)
 {
     return gtk_toggle_button_get_active(
         GTK_TOGGLE_BUTTON(checkboxes[idx]));
 }
 
+/**
+ * @brief Handles Up/Down arrow navigation for command history.
+ *
+ * @param w Entry widget
+ * @param e Key event
+ * @return gboolean TRUE if handled
+ */
 static gboolean cmd_key_press(GtkWidget *w, GdkEventKey *e)
 {
     if (cmd_hist_count == 0)
@@ -478,8 +613,15 @@ static gboolean cmd_key_press(GtkWidget *w, GdkEventKey *e)
     return FALSE;
 }
 
-/* ---------- Checkbox logic ---------- */
-
+/**
+ * @brief Handles sensor checkbox toggle event.
+ *
+ * Prevents deselecting below minimum during running state.
+ * Triggers dropdown update and graph redraw.
+ *
+ * @param btn Toggle button
+ * @return void
+ */
 static void checkbox_changed(GtkToggleButton *btn)
 {
     if (suppress_checkbox_cb)
@@ -500,8 +642,14 @@ static void checkbox_changed(GtkToggleButton *btn)
         gtk_widget_queue_draw(graph_area);
 }
 
-/* ---------- Hz ---------- */
-
+/**
+ * @brief Validates frequency entry field.
+ *
+ * Ensures numeric value within 10–1000 Hz.
+ * Updates visual error styling.
+ *
+ * @return void
+ */
 static void hz_changed()
 {
     const char *txt = gtk_entry_get_text(GTK_ENTRY(hz_entry));
@@ -541,6 +689,14 @@ static void hz_changed()
     set_enabled(config_btn, valid);
 }
 
+/**
+ * @brief Sends CONFIGURE command to server.
+ *
+ * Validates selected sensor and frequency,
+ * updates local frequency model.
+ *
+ * @return void
+ */
 static void configure_clicked()
 {
     if (sock_fd < 0)
@@ -579,8 +735,13 @@ static void configure_clicked()
                          g_strdup(freq));
 }
 
-/* ---------- Command Line ---------- */
-
+/**
+ * @brief Opens CLI help text in external terminal.
+ *
+ * Spawns x-terminal-emulator with HELP_TEXT content.
+ *
+ * @return void
+ */
 static void open_help_terminal(void)
 {
     char cmd[4096];
@@ -603,6 +764,18 @@ static void open_help_terminal(void)
                   NULL, NULL, NULL, NULL);
 }
 
+/**
+ * @brief Parses and executes command entered in CLI entry field.
+ *
+ * Supports:
+ * CONNECT, DISCONNECT, START, STOP,
+ * SHUTDOWN, CONFIGURE, HELP
+ *
+ * Performs syntax validation and state checks.
+ *
+ * @param e Entry widget
+ * @return void
+ */
 static void cmd_enter(GtkEntry *e)
 {
     char buf[128];
@@ -972,9 +1145,12 @@ done:;
     g_timeout_add(5000, clear_cmd_feedback, ctx);
 }
 
-/* ---------- State Machine ---------- */
-
-/* ---------- Buttons ---------- */
+/**
+ * @brief Clears connection status label after timeout.
+ *
+ * @param data Pointer to label widget
+ * @return gboolean G_SOURCE_REMOVE
+ */
 static gboolean clear_connect_status(gpointer data)
 {
     GtkWidget *label = GTK_WIDGET(data);
@@ -983,6 +1159,15 @@ static gboolean clear_connect_status(gpointer data)
     return G_SOURCE_REMOVE; // run once
 }
 
+/**
+ * @brief Displays colored connection status message.
+ *
+ * Automatically clears after timeout.
+ *
+ * @param msg Message string
+ * @param color GTK markup color string
+ * @return void
+ */
 static void set_connect_status(const char *msg, const char *color)
 {
     if (!msg || !*msg)
@@ -1014,6 +1199,15 @@ static void set_connect_status(const char *msg, const char *color)
     }
 }
 
+/**
+ * @brief Handles Connect button click.
+ *
+ * Establishes TCP connection with timeout,
+ * starts network receive thread,
+ * initializes GUI state.
+ *
+ * @return void
+ */
 static void connect_clicked()
 {
     const char *ip = gtk_entry_get_text(GTK_ENTRY(connect_entry));
@@ -1114,9 +1308,18 @@ static void connect_clicked()
     apply_state();
 }
 
-static gboolean on_window_delete(GtkWidget *widget,
-                                 GdkEvent *event,
-                                 gpointer user_data)
+/**
+ * @brief Handles window close event.
+ *
+ * Prompts confirmation if connected,
+ * gracefully stops streaming and network thread.
+ *
+ * @param widget Window widget
+ * @param event GDK event
+ * @param user_data Unused
+ * @return gboolean TRUE to stop default handler
+ */
+static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer user_data)
 {
 
     (void)event;
@@ -1183,6 +1386,16 @@ static gboolean on_window_delete(GtkWidget *widget,
     return TRUE;
 }
 
+/**
+ * @brief Handles Disconnect button click.
+ *
+ * Stops network thread, closes socket,
+ * resets GUI state.
+ *
+ * @param b Button widget (unused)
+ * @param d User data (unused)
+ * @return void
+ */
 static void disconnect_clicked(GtkButton *b, gpointer d)
 {
     (void)b;
@@ -1207,6 +1420,13 @@ static void disconnect_clicked(GtkButton *b, gpointer d)
     apply_state();
 }
 
+/**
+ * @brief Sends START command to server.
+ *
+ * Transitions GUI state to RUNNING.
+ *
+ * @return void
+ */
 static void start_clicked()
 {
     if (sock_fd < 0)
@@ -1230,6 +1450,16 @@ static void start_clicked()
     apply_state();
 }
 
+/**
+ * @brief Receives exactly len bytes from socket.
+ *
+ * Blocks until full payload received or error occurs.
+ *
+ * @param fd Socket file descriptor
+ * @param buf Buffer to fill
+ * @param len Number of bytes to receive
+ * @return int 0 on success, -1 on failure
+ */
 static int recv_all(int fd, void *buf, size_t len)
 {
     size_t off = 0;
@@ -1245,6 +1475,13 @@ static int recv_all(int fd, void *buf, size_t len)
     return 0;
 }
 
+/**
+ * @brief Sends STOP command to server.
+ *
+ * Transitions GUI state to CONNECTED.
+ *
+ * @return void
+ */
 static void stop_clicked()
 {
     if (sock_fd < 0)
@@ -1257,6 +1494,15 @@ static void stop_clicked()
     apply_state();
 }
 
+/**
+ * @brief Adjusts background color for legend visibility.
+ *
+ * Lightens dark themes and darkens light themes
+ * for improved contrast.
+ *
+ * @param bg Background color
+ * @return GdkRGBA Adjusted color
+ */
 static GdkRGBA
 adjust_bg_for_legend(GdkRGBA bg)
 {
@@ -1286,6 +1532,23 @@ adjust_bg_for_legend(GdkRGBA bg)
     return out;
 }
 
+/**
+ * @brief Draw callback for plotting area.
+ *
+ * Renders:
+ * - Grid
+ * - Axes
+ * - Axis labels
+ * - Ticks
+ * - Dynamic legend
+ * - Real-time sensor traces
+ *
+ * Uses circular buffers and time-window clipping.
+ *
+ * @param widget Drawing area widget
+ * @param cr Cairo context
+ * @return gboolean FALSE
+ */
 static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
 {
     uint64_t t_max = 0;
@@ -1723,8 +1986,16 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
     return FALSE;
 }
 
-/* ---------- UI ---------- */
-
+/**
+ * @brief Application entry point.
+ *
+ * Initializes GTK, builds UI layout,
+ * connects signals, and starts main loop.
+ *
+ * @param argc Argument count
+ * @param argv Argument vector
+ * @return int Exit status
+ */
 int main(int argc, char **argv)
 {
     gtk_init(&argc, &argv);
