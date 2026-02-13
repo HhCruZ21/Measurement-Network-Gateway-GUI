@@ -24,6 +24,9 @@ static void *net_rx_thread(void *arg);
 static int recv_all(int fd, void *buf, size_t len);
 static void set_connect_status(const char *msg, const char *color);
 static void connect_clicked(GtkButton *b, gpointer d);
+static void disconnect_clicked(GtkButton *b, gpointer d);
+static void start_clicked(GtkButton *b, gpointer d);
+static void stop_clicked(GtkButton *b, gpointer d);
 
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -702,6 +705,96 @@ static void cmd_enter(GtkEntry *e, gpointer d)
         goto done;
     }
 
+    /* ================= DISCONNECT ================= */
+    if (g_ascii_strcasecmp(tok1, "DISCONNECT") == 0)
+    {
+        if (tok2 || tok3 || extra)
+        {
+            err = CMD_ERR_SYNTAX;
+            goto done;
+        }
+
+        if (state == STATE_DISCONNECTED)
+        {
+            err = CMD_ERR_NOT_CONNECTED; // add this enum if not exists
+            goto done;
+        }
+
+        if (state == STATE_RUNNING)
+        {
+            err = CMD_ERR_RUNNING; // <-- add this enum
+            goto done;
+        }
+
+        /* Trigger same workflow as button click */
+        disconnect_clicked(NULL, NULL);
+
+        valid = TRUE;
+        err = CMD_OK;
+
+        goto done;
+    }
+
+    /* ================= START ================= */
+    if (g_ascii_strcasecmp(tok1, "START") == 0)
+    {
+        if (tok2 || tok3 || extra)
+        {
+            err = CMD_ERR_SYNTAX;
+            goto done;
+        }
+
+        if (state == STATE_DISCONNECTED)
+        {
+            err = CMD_ERR_NOT_CONNECTED;
+            goto done;
+        }
+
+        if (state == STATE_RUNNING)
+        {
+            err = CMD_ERR_ALREADY_RUNNING; // add this enum
+            goto done;
+        }
+
+        /* Trigger same workflow as button click */
+        start_clicked(NULL, NULL);
+
+        valid = TRUE;
+        err = CMD_OK;
+
+        goto done;
+    }
+
+    /* ================= STOP ================= */
+    if (g_ascii_strcasecmp(tok1, "STOP") == 0)
+    {
+        if (tok2 || tok3 || extra)
+        {
+            err = CMD_ERR_SYNTAX;
+            goto done;
+        }
+
+        if (state == STATE_DISCONNECTED)
+        {
+            err = CMD_ERR_NOT_CONNECTED;
+            goto done;
+        }
+
+        if (state != STATE_RUNNING)
+        {
+            err = CMD_ERR_NOT_RUNNING; // add this enum
+            goto done;
+        }
+
+        /* Trigger same workflow as button click */
+        stop_clicked(NULL, NULL);
+
+        valid = TRUE;
+        err = CMD_OK;
+
+        goto done;
+    }
+
     /* ================= CONFIGURE ================= */
     if (g_ascii_strcasecmp(tok1, "CONFIGURE") == 0)
     {
@@ -807,12 +900,32 @@ done:;
         {
         case CMD_ERR_FREQ_RANGE:
             gtk_label_set_text(GTK_LABEL(cmd_status),
-                               "Command execution failed. Valid frequency is between 10 and 1000 Hz. Use help command for info.");
+                               "Valid frequency is between 10 and 1000 Hz.");
+            break;
+
+        case CMD_ERR_NOT_CONNECTED:
+            gtk_label_set_text(GTK_LABEL(cmd_status),
+                               "Cannot disconnect: no active connection.");
+            break;
+
+        case CMD_ERR_RUNNING:
+            gtk_label_set_text(GTK_LABEL(cmd_status),
+                               "Cannot disconnect: GUI is running, stop and disconnect.");
+            break;
+
+        case CMD_ERR_ALREADY_RUNNING:
+            gtk_label_set_text(GTK_LABEL(cmd_status),
+                               "Already running.");
+            break;
+
+        case CMD_ERR_NOT_RUNNING:
+            gtk_label_set_text(GTK_LABEL(cmd_status),
+                               "Cannot stop: not currently running.");
             break;
 
         default:
             gtk_label_set_text(GTK_LABEL(cmd_status),
-                               "Command execution failed. Use help command for info");
+                               "Invalid command. Use HELP for available commands.");
             break;
         }
 
@@ -889,6 +1002,9 @@ static void connect_clicked(GtkButton *b, gpointer d)
         return;
     }
 
+    int flags = fcntl(sock_fd, F_GETFL, 0);
+    fcntl(sock_fd, F_SETFL, flags | O_NONBLOCK);
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -903,16 +1019,55 @@ static void connect_clicked(GtkButton *b, gpointer d)
         return;
     }
 
-    if (connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    int res = connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr));
+
+    if (res < 0)
     {
-        perror("connect");
-        set_connect_status(
-            "Connect failed, check if server is running",
-            "red");
-        close(sock_fd);
-        sock_fd = -1;
-        return;
+        if (errno != EINPROGRESS)
+        {
+            perror("connect");
+            set_connect_status("Connect failed", "red");
+            close(sock_fd);
+            sock_fd = -1;
+            return;
+        }
+
+        /* Wait with timeout using select */
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock_fd, &wfds);
+
+        struct timeval tv;
+        tv.tv_sec = 3; // 3 second timeout
+        tv.tv_usec = 0;
+
+        res = select(sock_fd + 1, NULL, &wfds, NULL, &tv);
+
+        if (res <= 0)
+        {
+            set_connect_status("Connection timeout", "red");
+            close(sock_fd);
+            sock_fd = -1;
+            return;
+        }
+
+        /* Check for socket error */
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        getsockopt(sock_fd, SOL_SOCKET, SO_ERROR, &so_error, &len);
+
+        if (so_error != 0)
+        {
+            set_connect_status("Connection refused/unreachable", "red");
+            close(sock_fd);
+            sock_fd = -1;
+            return;
+        }
     }
+
+    /* Restore blocking mode after successful connect */
+    int flags2 = fcntl(sock_fd, F_GETFL, 0);
+    fcntl(sock_fd, F_SETFL, flags2 & ~O_NONBLOCK);
 
     printf("Connected to server %s\n", ip);
     set_connect_status("Connection successful", "green");
@@ -1709,7 +1864,7 @@ int main(int argc, char **argv)
     /* Section D */
     cmd_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(cmd_entry),
-                                   "CONFIGURE SENSOR_ID FREQ_IN_HZ");
+                                   "Type commands here, use help for command info.");
     gtk_box_pack_start(GTK_BOX(main_v), cmd_entry, FALSE, FALSE, 0);
     /* Command line default icon (idle state) */
     gtk_entry_set_icon_from_icon_name(
