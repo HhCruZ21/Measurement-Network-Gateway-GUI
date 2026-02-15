@@ -41,7 +41,6 @@
 
 #include "utils.h"
 
-#define VISIBLE_CYCLES 5
 #define VISIBLE_SAMPLES 300
 #define MIN_WINDOW_US 50000ULL   // 50 ms
 #define MAX_WINDOW_US 5000000ULL // 5 s
@@ -1894,19 +1893,6 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
     int tick_count = plot_w / grid_spacing;
     if (tick_count < 1)
         tick_count = 1;
-
-    int ref_sensor = -1;
-    for (int s = 0; s < SENSOR_COUNT; s++)
-    {
-        if (is_sensor_selected(s) && visible_count[s] > 1)
-        {
-            ref_sensor = s;
-            break;
-        }
-    }
-
-    if (ref_sensor < 0)
-        ref_sensor = 0;
 
     for (int i = 0; i <= tick_count; i++)
     {
