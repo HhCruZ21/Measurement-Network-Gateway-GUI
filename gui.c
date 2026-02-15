@@ -77,11 +77,11 @@ static int cmd_hist_index = -1;
 
 /* ---------- Per-sensor Y scaling ---------- */
 static const double sensor_y_max[SENSOR_COUNT] = {
-    1024.0, // Temp (raw RTD-ish)
+    32768.0, // Temp
     4095.0, // ADC 0
     4095.0, // ADC 1
     255.0,  // Switches
-    1.0     // Push buttons
+    31.0     // Push buttons
 };
 
 const char *sensor_ids[SENSOR_COUNT] = {
