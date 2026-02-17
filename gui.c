@@ -78,9 +78,9 @@ static int cmd_hist_index = -1;
 /* ---------- Per-sensor Y scaling ---------- */
 static const double sensor_y_max[SENSOR_COUNT] = {
     32768.0, // Temp
-    4095.0, // ADC 0
-    4095.0, // ADC 1
-    255.0,  // Switches
+    4095.0,  // ADC 0
+    4095.0,  // ADC 1
+    255.0,   // Switches
     31.0     // Push buttons
 };
 
@@ -453,8 +453,6 @@ static void *net_rx_thread()
                             pkt->timestamp);
             }
         }
-
-        g_idle_add(redraw_graph, NULL);
     }
 
     g_idle_add(handle_connection_lost, NULL);
@@ -1764,13 +1762,37 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
             legend_items++;
     }
 
+    double max_text_width = 0.0;
+    cairo_set_font_size(cr, 12);
+
+    /* Include title width */
+    cairo_text_extents_t ext;
+    cairo_text_extents(cr, "Legend:", &ext);
+    max_text_width = ext.width;
+
+    for (int i = 0; i < SENSOR_COUNT; i++)
+    {
+        if (!is_sensor_selected(i))
+            continue;
+
+        cairo_text_extents(cr, sensor_labels[i], &ext);
+        if (ext.width > max_text_width)
+            max_text_width = ext.width;
+    }
+
+    const int legend_padding = 10;
+    const int box_size = 12;
+    const int text_offset = box_size + 8;
+
+    double legend_width =
+        legend_padding * 2 +
+        text_offset +
+        max_text_width;
+
     const int legend_x = left_margin + plot_w - 190;
 
     int legend_y = 24;
-    const int box_size = 12;
     const int row_spacing = 20;
-
-    const int legend_padding = 10;
 
     /* Legend height = padding + title + rows */
     int legend_height =
@@ -1800,7 +1822,7 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
     cairo_rectangle(cr,
                     legend_x - legend_padding,
                     legend_y - row_spacing + 4,
-                    130,
+                    legend_width,
                     legend_height);
     cairo_fill(cr);
 
@@ -1915,7 +1937,6 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
 
         snprintf(label, sizeof(label), "%" PRIu64, abs_ms);
 
-        cairo_text_extents_t ext;
         cairo_text_extents(cr, label, &ext);
 
         cairo_move_to(cr,
@@ -1925,7 +1946,7 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
     }
 
     /* ================== X-axis Label ================== */
-    const char *xlabel = "Time (absolute monotonic, ms)";
+    const char *xlabel = "Time (ms)";
 
     cairo_select_font_face(cr, "Sans",
                            CAIRO_FONT_SLANT_NORMAL,
@@ -1937,7 +1958,6 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
                           fg.blue,
                           fg.alpha);
 
-    cairo_text_extents_t ext;
     cairo_text_extents(cr, xlabel, &ext);
 
     double x = (width - ext.width) / 2.0 - ext.x_bearing;
