@@ -9,7 +9,7 @@
 #define CMD_HISTORY_SIZE 5
 #define MAX_SAMPLES 1024
 // #define TIME_WINDOW_US 5e6 // 5 seconds visible
-#define Y_AXIS_MAX 5.0
+#define Y_AXIS_MAX 4.0
 
 extern uint64_t time_window_us;
 extern const char *HELP_TEXT;
@@ -23,6 +23,12 @@ typedef enum
     pb_sid,
     snsr_cnt
 } sensor_id_t;
+
+typedef struct {
+    double temp;
+    double adc_v;
+    double ts_us;
+} info_line;
 
 typedef struct
 {

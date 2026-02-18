@@ -53,8 +53,11 @@ static void connect_clicked();
 static void disconnect_clicked(GtkButton *b, gpointer d);
 static void start_clicked();
 static void stop_clicked();
+static gboolean update_secB_info(gpointer data);
+static int checked_count();
 
 GtkWidget *main_window = NULL;
+
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t sample_ts[SENSOR_COUNT][MAX_SAMPLES];
@@ -130,6 +133,9 @@ GtkWidget *checkboxes[SENSOR_COUNT];
 GtkWidget *combo;
 GtkWidget *hz_entry, *config_btn;
 GtkWidget *cmd_entry, *cmd_status;
+GtkWidget *secB_info_view;
+GtkTextBuffer *secB_info_buffer;
+GtkWidget *info_scroll;
 
 GHashTable *sensor_freq;
 
@@ -187,18 +193,98 @@ static void apply_state()
     set_enabled(start_btn, connected && !running);
     set_enabled(stop_btn, running);
 
-    suppress_checkbox_cb = TRUE;
+    if (!running)
+    {
+        /* Not running → disable all */
+        for (int i = 0; i < SENSOR_COUNT; i++)
+            set_enabled(checkboxes[i], FALSE);
+    }
+    else
+    {
+        /* Running → enforce 2-sensor rule */
+        int selected = checked_count();
 
-    for (int i = 0; i < SENSOR_COUNT; i++)
-        set_enabled(checkboxes[i], running);
+        for (int i = 0; i < SENSOR_COUNT; i++)
+        {
+            gboolean active =
+                gtk_toggle_button_get_active(
+                    GTK_TOGGLE_BUTTON(checkboxes[i]));
 
-    suppress_checkbox_cb = FALSE;
+            if (selected >= 2 && !active)
+                set_enabled(checkboxes[i], FALSE);
+            else
+                set_enabled(checkboxes[i], TRUE);
+        }
+    }
 
     set_enabled(combo, running);
     set_enabled(hz_entry, running);
     set_enabled(config_btn,
                 running && strlen(gtk_entry_get_text(GTK_ENTRY(hz_entry))) > 0);
     set_enabled(cmd_entry, TRUE);
+}
+
+static void update_info_text_colors(GtkWidget *widget)
+{
+    GtkStyleContext *ctx =
+        gtk_widget_get_style_context(secB_info_view);
+
+    GdkRGBA fg;
+    gtk_style_context_get_color(ctx,
+                                GTK_STATE_FLAG_NORMAL,
+                                &fg);
+
+    GdkRGBA time_color = fg;
+    time_color.alpha = 0.65;
+
+    GtkTextTagTable *table =
+        gtk_text_buffer_get_tag_table(secB_info_buffer);
+
+    GtkTextTag *temp_tag =
+        gtk_text_tag_table_lookup(table, "temp_tag");
+
+    GtkTextTag *adc_tag =
+        gtk_text_tag_table_lookup(table, "adc_tag");
+
+    GtkTextTag *time_tag =
+        gtk_text_tag_table_lookup(table, "time_tag");
+
+    if (!temp_tag)
+    {
+        temp_tag = gtk_text_buffer_create_tag(
+            secB_info_buffer,
+            "temp_tag",
+            NULL);
+    }
+
+    if (!adc_tag)
+    {
+        adc_tag = gtk_text_buffer_create_tag(
+            secB_info_buffer,
+            "adc_tag",
+            NULL);
+    }
+
+    if (!time_tag)
+    {
+        time_tag = gtk_text_buffer_create_tag(
+            secB_info_buffer,
+            "time_tag",
+            NULL);
+    }
+
+    /* Update tag colors instead of recreating */
+    g_object_set(temp_tag,
+                 "foreground-rgba", &fg,
+                 NULL);
+
+    g_object_set(adc_tag,
+                 "foreground-rgba", &fg,
+                 NULL);
+
+    g_object_set(time_tag,
+                 "foreground-rgba", &time_color,
+                 NULL);
 }
 
 /**
@@ -482,13 +568,20 @@ static gboolean entry_focus_out(GtkWidget *w)
 static void update_dropdown()
 {
     gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(combo));
+
+    int added = 0;
     for (int i = 0; i < SENSOR_COUNT; i++)
     {
         if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(checkboxes[i])))
+        {
             gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo),
                                       sensor_ids[i], sensor_labels[i]);
+            added++;
+        }
     }
-    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
+
+    if (added > 0)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
 }
 
 /**
@@ -504,41 +597,64 @@ static void update_dropdown()
  */
 void push_sample(int sid, double value, uint64_t ts)
 {
-    static uint64_t last_ts = 0;
-
-    /* Detect timestamp reset or backward jump */
-    if (last_ts != 0 && ts < last_ts)
-    {
-        printf("[GUI] Timestamp reset detected → clearing buffers\n");
-
-        pthread_mutex_lock(&sample_lock);
-        for (int s = 0; s < SENSOR_COUNT; s++)
-        {
-            sample_count[s] = 0;
-            sample_head[s] = 0;
-        }
-        pthread_mutex_unlock(&sample_lock);
-
-        server_t0 = ts;
-    }
+    pthread_mutex_lock(&sample_lock);
 
     if (server_t0 == 0)
         server_t0 = ts;
 
+    /* Convert to relative time */
     uint64_t rel_ts = ts - server_t0;
-    last_ts = ts;
 
-    pthread_mutex_lock(&sample_lock);
+    int head = sample_head[sid];
 
-    sample_data[sid][sample_head[sid]] = value;
-    sample_ts[sid][sample_head[sid]] = rel_ts;
-
-    sample_head[sid] = (sample_head[sid] + 1) % MAX_SAMPLES;
+    sample_data[sid][head] = value;
+    sample_ts[sid][head] = rel_ts;
 
     if (sample_count[sid] < MAX_SAMPLES)
         sample_count[sid]++;
 
+    sample_head[sid] = (head + 1) % MAX_SAMPLES;
+
     pthread_mutex_unlock(&sample_lock);
+
+    /* Trigger redraw */
+    g_idle_add((GSourceFunc)gtk_widget_queue_draw, graph_area);
+
+    /* ---- NEW: Log last 10 Temp + ADC1 with timestamp ---- */
+    /* ---- Log only once per timestamp (on ADC1 arrival) ---- */
+    if (sid == 2) // Use ADC1 as commit trigger
+    {
+        pthread_mutex_lock(&sample_lock);
+
+        double temp = 0.0;
+        double adc1 = 0.0;
+        uint64_t rel_ts = 0;
+
+        /* Latest TEMP */
+        if (sample_count[0] > 0)
+        {
+            int idx0 = (sample_head[0] - 1 + MAX_SAMPLES) % MAX_SAMPLES;
+            temp = sample_data[0][idx0];
+        }
+
+        /* Latest ADC1 */
+        if (sample_count[2] > 0)
+        {
+            int idx2 = (sample_head[2] - 1 + MAX_SAMPLES) % MAX_SAMPLES;
+            adc1 = sample_data[2][idx2];
+            rel_ts = sample_ts[2][idx2];
+        }
+
+        pthread_mutex_unlock(&sample_lock);
+
+        info_line *info = g_malloc(sizeof(info_line));
+
+        info->temp = temp;
+        info->adc_v = (adc1 / 4095.0) * 3.3;
+        info->ts_us = rel_ts / 1000.0;
+
+        g_idle_add(update_secB_info, info);
+    }
 }
 
 /**
@@ -624,12 +740,44 @@ static void checkbox_changed(GtkToggleButton *btn)
     if (suppress_checkbox_cb)
         return;
 
-    if (state == STATE_RUNNING)
+    int selected = 0;
+
+    for (int i = 0; i < SENSOR_COUNT; i++)
     {
-        if (checked_count() < 2)
+        if (gtk_toggle_button_get_active(
+                GTK_TOGGLE_BUTTON(checkboxes[i])))
         {
-            gtk_toggle_button_set_active(btn, TRUE);
-            return;
+            selected++;
+        }
+    }
+
+    /* If more than 2 selected, revert this toggle */
+    if (selected > 2)
+    {
+        suppress_checkbox_cb = TRUE;
+        gtk_toggle_button_set_active(btn, FALSE);
+        suppress_checkbox_cb = FALSE;
+        return;
+    }
+
+    /* If exactly 2 selected → disable all unchecked */
+    if (selected == 2)
+    {
+        for (int i = 0; i < SENSOR_COUNT; i++)
+        {
+            if (!gtk_toggle_button_get_active(
+                    GTK_TOGGLE_BUTTON(checkboxes[i])))
+            {
+                gtk_widget_set_sensitive(checkboxes[i], FALSE);
+            }
+        }
+    }
+    else
+    {
+        /* If less than 2 → enable all */
+        for (int i = 0; i < SENSOR_COUNT; i++)
+        {
+            gtk_widget_set_sensitive(checkboxes[i], TRUE);
         }
     }
 
@@ -1302,6 +1450,12 @@ static void connect_clicked()
     state = STATE_CONNECTED;
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(checkboxes[0]), TRUE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(checkboxes[2]), TRUE);
+
+    for (int i = 0; i < SENSOR_COUNT; i++)
+    {
+        if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(checkboxes[i])))
+            gtk_widget_set_sensitive(checkboxes[i], FALSE);
+    }
     apply_state();
 }
 
@@ -1442,6 +1596,7 @@ static void start_clicked()
     printf("Sent START\n");
 
     state = STATE_RUNNING;
+    gtk_widget_set_sensitive(secB_info_view, FALSE);
 
     update_dropdown();
     apply_state();
@@ -1488,6 +1643,8 @@ static void stop_clicked()
     printf("Sent STOP\n");
 
     state = STATE_CONNECTED;
+    gtk_widget_set_sensitive(secB_info_view, TRUE);
+
     apply_state();
 }
 
@@ -1527,6 +1684,74 @@ adjust_bg_for_legend(GdkRGBA bg)
 
     out.alpha = 1.0;
     return out;
+}
+
+static gboolean update_secB_info(gpointer data)
+{
+    info_line *info = (info_line *)data;
+
+    GtkPolicyType hpol, vpol;
+
+    gtk_scrolled_window_get_policy(
+        GTK_SCROLLED_WINDOW(info_scroll),
+        &hpol, &vpol);
+    int max_lines = 10;
+    /* Remove first line if already 10 lines */
+    gint line_count =
+        gtk_text_buffer_get_line_count(secB_info_buffer);
+
+    if (line_count >= max_lines)
+    {
+        GtkTextIter line_start, line_end;
+
+        gtk_text_buffer_get_iter_at_line(
+            secB_info_buffer, &line_start, 0);
+
+        gtk_text_buffer_get_iter_at_line(
+            secB_info_buffer, &line_end, 1);
+
+        gtk_text_buffer_delete(
+            secB_info_buffer, &line_start, &line_end);
+    }
+
+    GtkTextIter iter;
+    gtk_text_buffer_get_end_iter(secB_info_buffer, &iter);
+
+    char buf[128];
+
+    /* Temp */
+    snprintf(buf, sizeof(buf),
+             "Temp: %-10.2f    |    ",
+             info->temp);
+
+    gtk_text_buffer_insert_with_tags_by_name(
+        secB_info_buffer, &iter,
+        buf, -1,
+        "temp_tag", NULL);
+
+    /* ADC */
+    snprintf(buf, sizeof(buf),
+             "ADC1: %6.2f V    |    ",
+             info->adc_v);
+
+    gtk_text_buffer_insert_with_tags_by_name(
+        secB_info_buffer, &iter,
+        buf, -1,
+        "adc_tag", NULL);
+
+    /* Time */
+    snprintf(buf, sizeof(buf),
+             "t = %.3f µs\n",
+             info->ts_us);
+
+    gtk_text_buffer_insert_with_tags_by_name(
+        secB_info_buffer, &iter,
+        buf, -1,
+        "time_tag", NULL);
+
+    g_free(info);
+
+    return FALSE;
 }
 
 /**
@@ -1967,7 +2192,7 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
     cairo_show_text(cr, xlabel);
 
     /* ================== Y-axis Label ================== */
-    const char *ylabel = "Value";
+    const char *ylabel = "Value (V)";
 
     cairo_save(cr);
     cairo_translate(cr, outer_left_margin + 2, height / 2);
@@ -2102,6 +2327,7 @@ int main(int argc, char **argv)
     /* Section B */
     /* ---------- Section B : Graph ---------- */
     GtkWidget *secB = gtk_frame_new("Plot");
+
     gtk_widget_set_vexpand(secB, TRUE);
     gtk_box_pack_start(GTK_BOX(main_v), secB, TRUE, TRUE, 0);
 
@@ -2117,6 +2343,47 @@ int main(int argc, char **argv)
     g_signal_connect(main_window, "style-updated",
                      G_CALLBACK(gtk_widget_queue_draw),
                      graph_area);
+
+    g_signal_connect(main_window,
+                     "style-updated",
+                     G_CALLBACK(update_info_text_colors),
+                     NULL);
+
+    /* ---- Section B Info Box ---- */
+    info_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_size_request(info_scroll, -1, 120);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(info_scroll),
+                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_AUTOMATIC);
+
+    secB_info_view = gtk_text_view_new();
+    PangoFontDescription *font =
+        pango_font_description_from_string("Monospace 11");
+
+    gtk_widget_override_font(secB_info_view, font);
+    pango_font_description_free(font);
+
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(secB_info_view), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(secB_info_view), FALSE);
+
+    secB_info_buffer =
+        gtk_text_view_get_buffer(GTK_TEXT_VIEW(secB_info_view));
+
+    update_info_text_colors(secB_info_view);
+
+    /* Wrap info box in frame with title */
+    GtkWidget *info_frame = gtk_frame_new("Temp & ADC 1");
+    gtk_widget_set_hexpand(info_frame, TRUE);
+    gtk_widget_set_vexpand(info_frame, FALSE);
+
+    gtk_frame_set_shadow_type(GTK_FRAME(info_frame),
+                              GTK_SHADOW_ETCHED_IN);
+    gtk_container_add(GTK_CONTAINER(info_scroll), secB_info_view);
+    gtk_container_add(GTK_CONTAINER(info_frame), info_scroll);
+
+    gtk_box_pack_start(GTK_BOX(main_v),
+                       info_frame,
+                       FALSE, FALSE, 4);
 
     /* Section C */
     GtkWidget *secC = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
