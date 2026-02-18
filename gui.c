@@ -224,8 +224,15 @@ static void apply_state()
     set_enabled(cmd_entry, TRUE);
 }
 
+static gboolean queue_graph_redraw(gpointer data)
+{
+    gtk_widget_queue_draw(GTK_WIDGET(data));
+    return G_SOURCE_REMOVE;
+}
+
 static void update_info_text_colors(GtkWidget *widget)
 {
+    (void)widget;
     GtkStyleContext *ctx =
         gtk_widget_get_style_context(secB_info_view);
 
@@ -618,7 +625,7 @@ void push_sample(int sid, double value, uint64_t ts)
     pthread_mutex_unlock(&sample_lock);
 
     /* Trigger redraw */
-    g_idle_add((GSourceFunc)gtk_widget_queue_draw, graph_area);
+    g_idle_add(queue_graph_redraw, graph_area);
 
     /* ---- NEW: Log last 10 Temp + ADC1 with timestamp ---- */
     /* ---- Log only once per timestamp (on ADC1 arrival) ---- */
@@ -880,33 +887,134 @@ static void configure_clicked()
                          g_strdup(freq));
 }
 
-/**
- * @brief Opens CLI help text in external terminal.
- *
- * Spawns x-terminal-emulator with HELP_TEXT content.
- *
- * @return void
- */
-static void open_help_terminal(void)
+static void show_help_dialog(void)
 {
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-             "cat << 'EOF'\n%s\nEOF\n"
-             "echo\n"
-             "read -p 'Press Enter to close...'\n",
-             HELP_TEXT);
+    GtkWidget *dialog = gtk_window_new(GTK_WINDOW_TOPLEVEL);
 
-    char *argv[] = {
-        "x-terminal-emulator",
-        "-e",
-        "bash",
-        "-c",
-        cmd,
-        NULL};
+    gtk_window_set_title(GTK_WINDOW(dialog), "CLI Help");
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 900, 650);
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(main_window));
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dialog), TRUE);
 
-    g_spawn_async(NULL, argv, NULL,
-                  G_SPAWN_SEARCH_PATH,
-                  NULL, NULL, NULL, NULL);
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_add(GTK_CONTAINER(dialog), vbox);
+
+    /* Allow maximize/minimize */
+    gtk_window_set_resizable(GTK_WINDOW(dialog), TRUE);
+
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 900, 650);
+
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_widget_set_vexpand(scroll, TRUE);
+    gtk_widget_set_hexpand(scroll, TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
+
+    GtkWidget *textview = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(textview), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(textview), FALSE);
+    gtk_container_add(GTK_CONTAINER(scroll), textview);
+
+    PangoFontDescription *font =
+        pango_font_description_from_string("Monospace 11");
+    gtk_widget_modify_font(textview, font);
+    pango_font_description_free(font);
+
+    GtkTextBuffer *buffer =
+        gtk_text_view_get_buffer(GTK_TEXT_VIEW(textview));
+
+    gtk_text_buffer_set_text(buffer, HELP_TEXT, -1);
+
+    /* ---------- TITLE TAG ---------- */
+    GtkTextTag *title_tag =
+        gtk_text_buffer_create_tag(buffer,
+                                   "title",
+                                   "weight", PANGO_WEIGHT_BOLD,
+                                   "scale", 1.6,
+                                   "foreground", "#6a5acd",
+                                   NULL);
+
+    GtkTextIter start, line_end;
+    gtk_text_buffer_get_iter_at_line(buffer, &start, 1);
+    gtk_text_buffer_get_iter_at_line(buffer, &line_end, 2);
+
+    gtk_text_buffer_apply_tag(buffer,
+                              title_tag,
+                              &start,
+                              &line_end);
+
+    /* ---------- SECTION TAG ---------- */
+    GtkTextTag *section_tag =
+        gtk_text_buffer_create_tag(buffer,
+                                   "section",
+                                   "weight", PANGO_WEIGHT_BOLD,
+                                   "scale", 1.2,
+                                   "foreground", "#888888",
+                                   NULL);
+
+    const char *sections[] = {
+        "VALID COMMANDS",
+        "INVALID EXAMPLES",
+        "NOTES"};
+
+    for (int i = 0; i < 3; i++)
+    {
+        GtkTextIter search_start, match_start, match_end;
+        gtk_text_buffer_get_start_iter(buffer, &search_start);
+
+        while (gtk_text_iter_forward_search(&search_start,
+                                            sections[i],
+                                            GTK_TEXT_SEARCH_TEXT_ONLY,
+                                            &match_start,
+                                            &match_end,
+                                            NULL))
+        {
+            gtk_text_buffer_apply_tag(buffer,
+                                      section_tag,
+                                      &match_start,
+                                      &match_end);
+
+            search_start = match_end;
+        }
+    }
+
+    /* ---------- COMMAND TAG ---------- */
+    GtkTextTag *command_tag =
+        gtk_text_buffer_create_tag(buffer,
+                                   "command",
+                                   "weight", PANGO_WEIGHT_BOLD,
+                                   "foreground", "#4a90e2",
+                                   NULL);
+
+    const char *commands[] = {
+        "CONNECT",
+        "DISCONNECT",
+        "START",
+        "STOP",
+        "SHUTDOWN",
+        "CONFIGURE"};
+
+    for (int i = 0; i < 6; i++)
+    {
+        GtkTextIter search_start, match_start, match_end;
+        gtk_text_buffer_get_start_iter(buffer, &search_start);
+
+        while (gtk_text_iter_forward_search(&search_start,
+                                            commands[i],
+                                            GTK_TEXT_SEARCH_TEXT_ONLY,
+                                            &match_start,
+                                            &match_end,
+                                            NULL))
+        {
+            gtk_text_buffer_apply_tag(buffer,
+                                      command_tag,
+                                      &match_start,
+                                      &match_end);
+
+            search_start = match_end;
+        }
+    }
+
+    gtk_widget_show_all(dialog);
 }
 
 /**
@@ -933,7 +1041,7 @@ static void cmd_enter(GtkEntry *e)
 
     if (g_ascii_strcasecmp(raw, "HELP") == 0)
     {
-        open_help_terminal();
+        show_help_dialog();
 
         /* ---- ADD THIS BLOCK ---- */
         if (cmd_hist_count < CMD_HISTORY_SIZE)
@@ -955,9 +1063,7 @@ static void cmd_enter(GtkEntry *e)
             "help-browser-symbolic");
 
         gtk_label_set_text(GTK_LABEL(cmd_status),
-                           "Help opened in terminal");
-
-        gtk_widget_set_sensitive(GTK_WIDGET(e), FALSE);
+                           "Help opened");
 
         g_free(raw);
 
@@ -984,6 +1090,70 @@ static void cmd_enter(GtkEntry *e)
     {
         err = CMD_ERR_SYNTAX;
         goto done;
+    }
+
+    if (g_ascii_strcasecmp(tok1, "STATUS") == 0)
+    {
+        if (tok2 || tok3 || extra)
+        {
+            err = CMD_ERR_SYNTAX;
+            goto done;
+        }
+
+        char status_msg[128];
+
+        switch (state)
+        {
+        case STATE_DISCONNECTED:
+            snprintf(status_msg, sizeof(status_msg),
+                     "State: DISCONNECTED");
+            break;
+
+        case STATE_CONNECTED:
+            snprintf(status_msg, sizeof(status_msg),
+                     "State: CONNECTED");
+            break;
+
+        case STATE_RUNNING:
+            snprintf(status_msg, sizeof(status_msg),
+                     "State: RUNNING");
+            break;
+        }
+
+        /* Directly display status */
+        gtk_label_set_text(GTK_LABEL(cmd_status), status_msg);
+
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(cmd_status),
+            "text-green");
+
+        gtk_entry_set_icon_from_icon_name(
+            GTK_ENTRY(e),
+            GTK_ENTRY_ICON_PRIMARY,
+            "dialog-information-symbolic");
+
+        gtk_widget_set_sensitive(GTK_WIDGET(e), FALSE);
+
+        /* Add to history */
+        if (cmd_hist_count < CMD_HISTORY_SIZE)
+            cmd_history[cmd_hist_count++] = g_strdup("STATUS");
+        else
+        {
+            g_free(cmd_history[0]);
+            memmove(&cmd_history[0], &cmd_history[1],
+                    (CMD_HISTORY_SIZE - 1) * sizeof(char *));
+            cmd_history[CMD_HISTORY_SIZE - 1] = g_strdup("STATUS");
+        }
+
+        cmd_hist_index = cmd_hist_count;
+
+        CmdClearCtx *ctx = g_malloc(sizeof(CmdClearCtx));
+        ctx->entry = GTK_WIDGET(e);
+        ctx->label = cmd_status;
+
+        g_timeout_add(5000, clear_cmd_feedback, ctx);
+
+        return; // <---- IMPORTANT
     }
 
     /* ================= CONNECT ================= */
@@ -1809,12 +1979,13 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
 
     const int grid_spacing = 70;        // bigger grid
     const int bottom_margin = 60;       // ticks ↔ x-axis label
-    const int left_margin = 60;         // ticks ↔ y-axis line
+    const int left_margin = 60;         // ticks ↔ y-axis line adc
+    const int right_margin = 80;        // ticks ↔ y-axis line temp
     const int outer_bottom_margin = 12; // space below x-axis label
     const int outer_left_margin = 15;   // space left of y-axis label
     const int arrow_size = 10;          // axis arrow size
 
-    plot_w = width - left_margin - 10;
+    plot_w = width - left_margin - right_margin;
     plot_h = height - bottom_margin - 10;
 
     if (t_max <= t_min)
@@ -2117,15 +2288,51 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
 
     cairo_stroke(cr);
 
+    /* ================== RIGHT Y-AXIS (Temperature) ================== */
+
+    int right_x = left_margin + plot_w;
+
+    /* Draw axis line */
+    cairo_move_to(cr, right_x + 0.5, arrow_size);
+    cairo_line_to(cr, right_x + 0.5, height - bottom_margin);
+    cairo_stroke(cr);
+
+    /* Draw arrow */
+    cairo_move_to(cr, right_x - arrow_size, arrow_size);
+    cairo_line_to(cr, right_x + 0.5, 0);
+    cairo_line_to(cr, right_x + arrow_size, arrow_size);
+    cairo_stroke(cr);
+
+    /* Draw ticks + labels */
+    cairo_set_font_size(cr, 11);
+
+    double temp_max = sensor_y_max[0]; // 32768
+
+    for (int i = 0; i <= grid_count; i++)
+    {
+        double y = (height - bottom_margin) - i * grid_spacing;
+
+        /* tick */
+        cairo_move_to(cr, right_x, y + 0.5);
+        cairo_line_to(cr, right_x + 6, y + 0.5);
+        cairo_stroke(cr);
+
+        /* label (real temperature scale) */
+        double value = temp_max * (double)i / grid_count;
+
+        char label[32];
+        snprintf(label, sizeof(label), "%.0f", value);
+
+        cairo_text_extents(cr, label, &ext);
+
+        cairo_move_to(cr,
+                      right_x + 8,
+                      y + ext.height / 2);
+        cairo_show_text(cr, label);
+    }
+
     /* ================== Axis Arrows ================== */
     cairo_set_line_width(cr, 2.5);
-
-    /* X-axis arrow (right) */
-    cairo_move_to(cr, left_margin + plot_w, height - bottom_margin);
-    cairo_line_to(cr, left_margin + plot_w + arrow_size, height - bottom_margin + 0.5);
-    cairo_line_to(cr, left_margin + plot_w, height - bottom_margin + arrow_size);
-
-    cairo_stroke(cr);
 
     /* Y-axis arrow (up) */
     cairo_move_to(cr, left_margin - arrow_size, arrow_size);
@@ -2191,7 +2398,33 @@ static gboolean draw_grid(GtkWidget *widget, cairo_t *cr)
     cairo_move_to(cr, x, y);
     cairo_show_text(cr, xlabel);
 
-    /* ================== Y-axis Label ================== */
+    /* ================== RIGHT Y-AXIS LABEL ================== */
+
+    const char *ylabel_r = "Temperature";
+
+    cairo_save(cr);
+
+    cairo_translate(cr,
+                    left_margin + plot_w + right_margin - 20,
+                    height / 2);
+
+    cairo_rotate(cr, G_PI / 2);
+
+    cairo_set_font_size(cr, 14);
+    cairo_set_source_rgba(cr,
+                          fg.red,
+                          fg.green,
+                          fg.blue,
+                          fg.alpha);
+
+    cairo_text_extents(cr, ylabel_r, &ext);
+
+    cairo_move_to(cr, -ext.width / 2, 0);
+    cairo_show_text(cr, ylabel_r);
+
+    cairo_restore(cr);
+
+    /* ================== LEFT Y-axis Label ================== */
     const char *ylabel = "Value (V)";
 
     cairo_save(cr);
@@ -2360,7 +2593,7 @@ int main(int argc, char **argv)
     PangoFontDescription *font =
         pango_font_description_from_string("Monospace 11");
 
-    gtk_widget_override_font(secB_info_view, font);
+    gtk_widget_modify_font(secB_info_view, font);
     pango_font_description_free(font);
 
     gtk_text_view_set_editable(GTK_TEXT_VIEW(secB_info_view), FALSE);
