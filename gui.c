@@ -356,7 +356,7 @@ static void shutdown_clicked(GtkButton *b, gpointer d)
         GTK_DIALOG_MODAL,
         GTK_MESSAGE_WARNING,
         GTK_BUTTONS_YES_NO,
-        "Are you sure you want to shutdown the device /dev/meascdd?");
+        "Are you sure you want to shutdown the application?");
 
     gtk_window_set_title(GTK_WINDOW(dialog), "Confirm Shutdown");
 
@@ -489,27 +489,6 @@ static void *net_rx_thread()
 
     while (net_running)
     {
-        // Peek first 6 bytes
-        ssize_t n = recv(sock_fd, hdr, 6, MSG_PEEK);
-        if (n <= 0)
-            break;
-
-        if (n == 6 && memcmp(hdr, "RATES\n", 6) == 0)
-        {
-            // Consume header
-            recv_all(sock_fd, hdr, 6);
-
-            sensor_rate_t rates[SENSOR_COUNT];
-            if (recv_all(sock_fd, rates, sizeof(rates)) < 0)
-                break;
-
-            RatesMsg *msg = g_malloc(sizeof(RatesMsg));
-            memcpy(msg->rates, rates, sizeof(msg->rates));
-            g_idle_add(handle_rates_update, msg);
-
-            continue;
-        }
-
         // Otherwise assume streaming batch
         uint32_t net_size;
         if (recv_all(sock_fd, &net_size, sizeof(net_size)) < 0)
@@ -1595,7 +1574,30 @@ static void start_clicked()
 
     printf("Sent START\n");
 
+    /* ---- Force default 300 Hz for all sensors locally ---- */
+    for (int i = 0; i < SENSOR_COUNT; i++)
+    {
+        g_hash_table_replace(sensor_freq,
+                             g_strdup(sensor_ids[i]),
+                             g_strdup("300"));
+    }
+
+    /* ---- Recalculate time window based on 300 Hz ---- */
+    double sample_period_us = 1000000.0 / 300.0;
+
+    time_window_us = (uint64_t)(VISIBLE_SAMPLES * sample_period_us);
+
+    if (time_window_us < MIN_WINDOW_US)
+        time_window_us = MIN_WINDOW_US;
+
+    if (time_window_us > MAX_WINDOW_US)
+        time_window_us = MAX_WINDOW_US;
+
+    printf("[GUI] Time window set to %.2f ms\n",
+           time_window_us / 1000.0);
+
     state = STATE_RUNNING;
+
     gtk_widget_set_sensitive(secB_info_view, FALSE);
 
     update_dropdown();
